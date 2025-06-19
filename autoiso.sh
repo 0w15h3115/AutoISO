@@ -1,65 +1,322 @@
 #!/bin/bash
-
-# Bootable ISO Creator Script
-# Tested on Debian/Ubuntu-based systems
-
+# ========================================
+#         A U T O M A T E D   I S O        
+# ========================================
+# AutoISO - Persistent Bootable Linux ISO Creator (Corrected Version)
 set -e
 
 ### Configuration
-WORKDIR=~/customiso
+WORKDIR=/tmp/iso
 EXTRACT_DIR="$WORKDIR/extract"
 CDROOT_DIR="$WORKDIR/cdroot"
-ISO_NAME=custom-linux.iso
-EXCLUDE_DIRS=("/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*" "/lost+found" "/home/*" ".cache")
+ISO_NAME="autoiso-persistent-$(date +%Y%m%d).iso"
 
-echo "[+] Installing dependencies..."
-sudo apt-get update
-sudo apt-get install -y genisoimage isolinux syslinux squashfs-tools xorriso rsync
+# Dynamic kernel detection
+KERNEL_VERSION=$(uname -r)
+KERNEL_FILE="/boot/vmlinuz-$KERNEL_VERSION"
+INITRD_FILE="/boot/initrd.img-$KERNEL_VERSION"
 
-echo "[+] Creating working directories..."
-mkdir -p "$CDROOT_DIR/boot/isolinux" "$EXTRACT_DIR"
+# Alternative kernel paths for different distributions
+if [[ ! -f "$KERNEL_FILE" ]]; then
+    KERNEL_FILE="/boot/vmlinuz"
+fi
+if [[ ! -f "$INITRD_FILE" ]]; then
+    INITRD_FILE="/boot/initrd.img"
+fi
 
-echo "[+] Copying system files..."
+EXCLUDE_DIRS=(
+    "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*" 
+    "/lost+found" "/home/*" ".cache" "/var/cache/*" "/var/log/*"
+    "/var/lib/docker/*" "/var/lib/containerd/*" "/snap/*" "/var/snap/*"
+    "/usr/src/*" "/var/lib/apt/lists/*" "/root/.cache/*"
+    "/swapfile" "/pagefile.sys" "*.log" "/var/crash/*"
+)
+
+### Validation
+echo "[AutoISO] Validating system requirements..."
+
+# Check if running as root or with sudo
+if [[ $EUID -eq 0 ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+    echo "[AutoISO] Running with sudo privileges"
+fi
+
+# Validate kernel files exist
+if [[ ! -f "$KERNEL_FILE" ]]; then
+    echo "[ERROR] Kernel file not found: $KERNEL_FILE"
+    echo "Available kernels:"
+    ls -la /boot/vmlinuz* 2>/dev/null || echo "No kernels found in /boot/"
+    exit 1
+fi
+
+if [[ ! -f "$INITRD_FILE" ]]; then
+    echo "[ERROR] Initrd file not found: $INITRD_FILE"
+    echo "Available initrd files:"
+    ls -la /boot/initrd* 2>/dev/null || echo "No initrd files found in /boot/"
+    exit 1
+fi
+
+echo "[AutoISO] Using kernel: $KERNEL_FILE"
+echo "[AutoISO] Using initrd: $INITRD_FILE"
+
+# Check available disk space (minimum 4GB recommended)
+AVAILABLE_SPACE=$(df /tmp | awk 'NR==2 {print $4}')
+if [[ $AVAILABLE_SPACE -lt 4194304 ]]; then
+    echo "[WARNING] Less than 4GB available in /tmp. Consider freeing space or changing WORKDIR."
+fi
+
+### Cleanup
+echo "[AutoISO] Cleaning old build..."
+$SUDO rm -rf "$WORKDIR"
+mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
+
+### Dependencies
+echo "[AutoISO] Installing required packages..."
+$SUDO apt-get update
+$SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools
+
+### Copy system files
+echo "[AutoISO] Copying system files (this may take several minutes)..."
 EXCLUDE_ARGS=()
 for dir in "${EXCLUDE_DIRS[@]}"; do
     EXCLUDE_ARGS+=(--exclude="$dir")
 done
 
-sudo rsync -aAX "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR"
+# Use progress indicator for rsync
+$SUDO rsync -aAXH --progress "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR"
 
-echo "[+] Creating compressed SquashFS of system..."
-sudo mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/filesystem.squashfs" -e boot
+### Prepare chroot environment
+echo "[AutoISO] Preparing chroot environment..."
+$SUDO mount --bind /dev "$EXTRACT_DIR/dev"
+$SUDO mount --bind /proc "$EXTRACT_DIR/proc"
+$SUDO mount --bind /sys "$EXTRACT_DIR/sys"
+$SUDO mount --bind /dev/pts "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
 
-echo "[+] Copying kernel and initrd..."
-KERNEL=$(ls /boot/vmlinuz-* | head -n 1)
-INITRD=$(ls /boot/initrd.img-* | head -n 1)
+# Function to cleanup mounts on exit
+cleanup_mounts() {
+    echo "[AutoISO] Cleaning up mounts..."
+    $SUDO umount "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
+    $SUDO umount "$EXTRACT_DIR/dev" 2>/dev/null || true
+    $SUDO umount "$EXTRACT_DIR/proc" 2>/dev/null || true
+    $SUDO umount "$EXTRACT_DIR/sys" 2>/dev/null || true
+}
+trap cleanup_mounts EXIT
 
-sudo cp "$KERNEL" "$CDROOT_DIR/boot/vmlinuz"
-sudo cp "$INITRD" "$CDROOT_DIR/boot/initrd"
+### Configure chroot environment
+echo "[AutoISO] Configuring live system..."
+$SUDO chroot "$EXTRACT_DIR" bash -c "
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y live-boot live-boot-initramfs-tools
+    
+    # Configure live-boot
+    echo 'live-boot live-boot/username string user' | debconf-set-selections
+    
+    # Clean package cache
+    apt-get clean
+    
+    # Remove unnecessary files
+    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/cache/apt/*
+    rm -rf /tmp/*
+    rm -rf /var/tmp/*
+    
+    # Create live user if it doesn't exist
+    if ! id -u user &>/dev/null; then
+        useradd -m -s /bin/bash user
+        echo 'user:live' | chpasswd
+        usermod -aG sudo user
+    fi
+"
 
-echo "[+] Adding ISOLINUX bootloader files..."
-sudo cp /usr/lib/ISOLINUX/isolinux.bin "$CDROOT_DIR/boot/isolinux/"
-sudo cp /usr/lib/syslinux/modules/bios/* "$CDROOT_DIR/boot/isolinux/"
+# Cleanup mounts
+cleanup_mounts
+trap - EXIT
 
-echo "[+] Creating isolinux.cfg..."
-cat <<EOF | sudo tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg"
+### Clean problematic files
+echo "[AutoISO] Cleaning up problematic files..."
+$SUDO find "$EXTRACT_DIR" -name "*.log" -size +10M -delete 2>/dev/null || true
+$SUDO find "$EXTRACT_DIR" -type f -path "*/var/cache/*" -delete 2>/dev/null || true
+
+# Remove files with paths longer than ISO9660 limit (more aggressive cleanup)
+echo "[AutoISO] Removing files with long paths..."
+$SUDO find "$EXTRACT_DIR" -type f | while IFS= read -r file; do
+    # Calculate relative path from extract dir
+    rel_path="${file#$EXTRACT_DIR/}"
+    if [[ ${#rel_path} -gt 180 ]]; then
+        echo "Removing long path: $rel_path"
+        $SUDO rm -f "$file" 2>/dev/null || true
+    fi
+done
+
+# Remove problematic directories that often cause issues
+PROBLEMATIC_DIRS=(
+    "$EXTRACT_DIR/var/lib/docker"
+    "$EXTRACT_DIR/var/lib/containerd"
+    "$EXTRACT_DIR/snap"
+    "$EXTRACT_DIR/var/snap"
+    "$EXTRACT_DIR/usr/src"
+    "$EXTRACT_DIR/var/lib/apt/lists"
+    "$EXTRACT_DIR/var/cache"
+    "$EXTRACT_DIR/tmp"
+    "$EXTRACT_DIR/var/tmp"
+    "$EXTRACT_DIR/root/.cache"
+    "$EXTRACT_DIR/home/*/.cache"
+    "$EXTRACT_DIR/home/*/.local/share/Trash"
+    "$EXTRACT_DIR/home/*/.mozilla/firefox/*/cache2"
+    "$EXTRACT_DIR/home/*/.config/google-chrome/*/Cache"
+)
+
+for dir_pattern in "${PROBLEMATIC_DIRS[@]}"; do
+    if [[ "$dir_pattern" == *"*"* ]]; then
+        # Handle glob patterns
+        for dir in $dir_pattern; do
+            if [[ -d "$dir" ]]; then
+                echo "Removing problematic directory: $dir"
+                $SUDO rm -rf "$dir" 2>/dev/null || true
+            fi
+        done
+    else
+        if [[ -d "$dir_pattern" ]]; then
+            echo "Removing problematic directory: $dir_pattern"
+            $SUDO rm -rf "$dir_pattern" 2>/dev/null || true
+        fi
+    fi
+done
+
+### Create SquashFS filesystem
+echo "[AutoISO] Creating SquashFS filesystem (this may take several minutes)..."
+$SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
+    -e boot \
+    -no-exports \
+    -noappend \
+    -comp xz \
+    -processors $(nproc)
+
+### Copy kernel and initrd
+echo "[AutoISO] Copying kernel and initrd files..."
+$SUDO cp "$KERNEL_FILE" "$CDROOT_DIR/live/vmlinuz"
+$SUDO cp "$INITRD_FILE" "$CDROOT_DIR/live/initrd"
+
+### Setup ISOLINUX bootloader
+echo "[AutoISO] Setting up ISOLINUX bootloader..."
+
+# Find correct isolinux paths (different distributions use different locations)
+ISOLINUX_BIN=""
+SYSLINUX_MODULES=""
+
+for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux; do
+    if [[ -f "$path/isolinux.bin" ]]; then
+        ISOLINUX_BIN="$path/isolinux.bin"
+        break
+    fi
+done
+
+for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux; do
+    if [[ -d "$path" ]]; then
+        SYSLINUX_MODULES="$path"
+        break
+    fi
+done
+
+if [[ -z "$ISOLINUX_BIN" ]]; then
+    echo "[ERROR] isolinux.bin not found. Please install isolinux package."
+    exit 1
+fi
+
+$SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
+
+# Copy syslinux modules
+if [[ -n "$SYSLINUX_MODULES" ]]; then
+    $SUDO cp "$SYSLINUX_MODULES"/*.c32 "$CDROOT_DIR/boot/isolinux/" 2>/dev/null || true
+    $SUDO cp "$SYSLINUX_MODULES"/*.com "$CDROOT_DIR/boot/isolinux/" 2>/dev/null || true
+fi
+
+### Create boot configuration
+echo "[AutoISO] Creating boot menu configuration..."
+cat <<EOF | $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null
 UI menu.c32
 PROMPT 0
-MENU TITLE Custom Live Linux
+MENU TITLE AutoISO Persistent Live System
 TIMEOUT 50
-DEFAULT linux
+DEFAULT persistent
 
-LABEL linux
-  KERNEL /boot/vmlinuz
-  APPEND initrd=/boot/initrd boot=live quiet splash
+LABEL persistent
+  MENU LABEL AutoISO Persistent Mode
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components persistence persistent=cryptsetup,removable quiet splash
+
+LABEL live
+  MENU LABEL AutoISO Live Mode (No Persistence)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components quiet splash
+
+LABEL memtest
+  MENU LABEL Memory Test
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components memtest
+
+MENU SEPARATOR
+
+LABEL reboot
+  MENU LABEL Reboot
+  COM32 reboot.c32
+
+LABEL poweroff
+  MENU LABEL Power Off
+  COM32 poweroff.c32
 EOF
 
-echo "[+] Building ISO..."
-cd "$CDROOT_DIR"
-sudo mkisofs -o "$WORKDIR/$ISO_NAME" \
-  -b boot/isolinux/isolinux.bin \
-  -c boot/isolinux/boot.cat \
-  -no-emul-boot -boot-load-size 4 -boot-info-table \
-  -J -R -V "CustomLinux" .
+### Create additional boot files
+echo "[AutoISO] Creating additional configuration files..."
 
-echo "[✓] ISO created at $WORKDIR/$ISO_NAME"
+# Create isolinux boot catalog
+$SUDO touch "$CDROOT_DIR/boot/isolinux/boot.cat"
+
+### Build final ISO
+echo "[AutoISO] Building final ISO image..."
+cd "$CDROOT_DIR"
+
+# Use more compatible ISO creation with filename length handling
+$SUDO genisoimage \
+    -o "$WORKDIR/$ISO_NAME" \
+    -b boot/isolinux/isolinux.bin \
+    -c boot/isolinux/boot.cat \
+    -no-emul-boot -boot-load-size 4 -boot-info-table \
+    -J -R -l -V "AutoISO" \
+    -allow-leading-dots \
+    -relaxed-filenames \
+    -allow-lowercase \
+    -allow-multidot \
+    -max-iso9660-filenames \
+    .
+
+# Make ISO readable by user
+$SUDO chmod 644 "$WORKDIR/$ISO_NAME"
+
+echo ""
+echo "=========================="
+echo "[✓] SUCCESS!"
+echo "=========================="
+echo "ISO created at: $WORKDIR/$ISO_NAME"
+echo "Size: $(du -h "$WORKDIR/$ISO_NAME" | cut -f1)"
+echo ""
+echo "=== USAGE INSTRUCTIONS ==="
+echo ""
+echo "1. Write ISO to USB drive:"
+echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress && sync"
+echo "   (Replace /dev/sdX with your USB device)"
+echo ""
+echo "2. Create persistence partition:"
+echo "   a) Use gparted or fdisk to create a second partition on the USB"
+echo "   b) Format it as ext4: sudo mkfs.ext4 -L persistence /dev/sdX2"
+echo "   c) Mount it: sudo mount /dev/sdX2 /mnt"
+echo "   d) Create persistence.conf: echo '/ union' | sudo tee /mnt/persistence.conf"
+echo "   e) Unmount: sudo umount /mnt"
+echo ""
+echo "3. Boot from USB and select 'AutoISO Persistent Mode'"
+echo ""
+echo "Note: Changes will be saved to the persistence partition automatically."
+echo "=============================="
