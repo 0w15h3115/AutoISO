@@ -1,39 +1,97 @@
-### Post-copy cleanup and fixes
-echo "[AutoISO] Performing post-copy cleanup..."
-
-# Fix any broken symlinks
-echo "[AutoISO] Fixing broken symbolic links..."
-if [ -d "$EXTRACT_DIR" ]; then
-    $SUDO find "$EXTRACT_DIR" -type l 2>/dev/null | while IFS= read -r link; do
-        if [ ! -e "$link" ]; then
-            echo "Removing broken symlink: $link"
-            $SUDO rm -f "$link" 2>/dev/null || true
-        fi
-    done
-fi
-
-# Ensure essential directories exist
-echo "[AutoISO] Creating essential directories..."
-$SUDO mkdir -p "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys" "$EXTRACT_DIR/run" "$EXTRACT_DIR/tmp" "$EXTRACT_DIR/var/tmp"
-$SUDO chmod 1777 "$EXTRACT_DIR/tmp" 2>/dev/null || true
-$SUDO chmod 1777 "$EXTRACT_DIR/var/tmp" 2>/dev/null || true#!/bin/bash
+#!/bin/bash
 # Ensure we're using bash
 if [ -z "$BASH_VERSION" ]; then
     echo "This script requires bash. Please run with: bash $0"
     exit 1
 fi
+
 # ========================================
 #         A U T O M A T E D   I S O        
 # ========================================
-# AutoISO - Persistent Bootable Linux ISO Creator (Corrected Version)
+# AutoISO - Persistent Bootable Linux ISO Creator (Improved Version)
+#
+# USAGE:
+#   ./autoiso.sh                           # Interactive disk selection
+#   ./autoiso.sh /mnt/external-drive       # Use specific disk
+#   WORKDIR=/mnt/ssd/build ./autoiso.sh    # Environment variable
+#
+# REQUIREMENTS:
+#   - At least 15GB free space on target disk
+#   - Root/sudo privileges
+#   - Debian/Ubuntu-based system
+#
+# EXAMPLES:
+#   ./autoiso.sh /mnt/external-ssd         # Use external SSD
+#   ./autoiso.sh /home/user/iso-build      # Use home directory
+#   ./autoiso.sh /media/user/USB-DRIVE     # Use mounted USB drive
+#
 set -e
 
+# Show help if requested
+if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    echo "AutoISO - Persistent Bootable Linux ISO Creator"
+    echo ""
+    echo "USAGE:"
+    echo "  $0 [WORK_DIRECTORY]"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  $0                           # Interactive selection"
+    echo "  $0 /mnt/external-drive       # Use external drive"
+    echo "  $0 /home/user/iso-build      # Use home directory"
+    echo ""
+    echo "ENVIRONMENT VARIABLES:"
+    echo "  WORKDIR                      # Set work directory"
+    echo ""
+    echo "REQUIREMENTS:"
+    echo "  - 15GB+ free space on target disk"
+    echo "  - Root/sudo privileges"
+    echo "  - Debian/Ubuntu-based system"
+    echo ""
+    echo "The script will create a subdirectory 'autoiso-build' in your chosen location."
+    echo ""
+    exit 0
+fi
+
 ### Configuration
-# Allow override of work directory via environment variable
-WORKDIR=${WORKDIR:-/tmp/iso}
+# Work directory selection with multiple options
+if [ -n "$1" ]; then
+    # Command line argument takes precedence
+    WORKDIR="$1/autoiso-build"
+elif [ -n "${WORKDIR}" ]; then
+    # Environment variable second
+    WORKDIR="${WORKDIR}"
+else
+    # Interactive selection if no argument provided
+    echo "=== AutoISO Disk Selection ==="
+    echo "Available disks and their free space:"
+    echo ""
+    df -h | grep -E "^/dev|^tmpfs" | grep -v "tmpfs.*tmp" | while read line; do
+        echo "  $line"
+    done
+    echo ""
+    echo "Current /tmp space: $(df -h /tmp | awk 'NR==2 {print $4}' | head -1)"
+    echo ""
+    echo "Recommendation: Choose a disk with at least 15GB free space"
+    echo ""
+    read -p "Enter work directory path (or press Enter for /tmp/iso): " user_workdir
+    if [ -n "$user_workdir" ]; then
+        WORKDIR="$user_workdir/autoiso-build"
+    else
+        WORKDIR="/tmp/iso"
+    fi
+fi
+
+# Ensure workdir is absolute path
+WORKDIR=$(realpath "$WORKDIR" 2>/dev/null || echo "$WORKDIR")
 EXTRACT_DIR="$WORKDIR/extract"
 CDROOT_DIR="$WORKDIR/cdroot"
-ISO_NAME="autoiso-persistent-$(date +%Y%m%d).iso"
+ISO_NAME="autoiso-persistent-$(date +%Y%m%d-%H%M).iso"
+
+echo ""
+echo "=== Selected Configuration ==="
+echo "Work Directory: $WORKDIR"
+echo "Final ISO will be: $WORKDIR/$ISO_NAME"
+echo ""
 
 # Dynamic kernel detection
 KERNEL_VERSION=$(uname -r)
@@ -56,73 +114,132 @@ EXCLUDE_DIRS=(
     "/swapfile" "/pagefile.sys" "*.log" "/var/crash/*"
     "/var/lib/lxcfs/*" "/var/lib/systemd/coredump/*"
     "/var/spool/*" "/var/backups/*" "/boot/efi/*"
+    "/var/lib/flatpak/*" "/var/lib/snapd/*"
 )
 
+### Functions
+log_info() {
+    echo "[AutoISO] $1"
+}
+
+log_error() {
+    echo "[ERROR] $1" >&2
+}
+
+log_warning() {
+    echo "[WARNING] $1" >&2
+}
+
+check_space() {
+    local min_space_gb=${1:-2}
+    local min_space_kb=$((min_space_gb * 1024 * 1024))
+    local space=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
+    local space_gb=$((space / 1024 / 1024))
+    
+    if [ "$space" -lt "$min_space_kb" ]; then
+        log_error "Insufficient space in $WORKDIR: ${space_gb}GB available, ${min_space_gb}GB required"
+        echo ""
+        echo "=== Available Disks ==="
+        df -h | grep -E "^/dev" | grep -v "tmpfs"
+        echo ""
+        echo "To use a different disk, run:"
+        echo "  $0 /path/to/disk/with/more/space"
+        echo "  # OR set environment variable:"
+        echo "  export WORKDIR=/path/to/disk/autoiso-work"
+        echo "  $0"
+        return 1
+    fi
+    log_info "Available space in $WORKDIR: ${space_gb}GB"
+    return 0
+}
+
+cleanup_mounts() {
+    log_info "Cleaning up mounts..."
+    $SUDO umount "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
+    $SUDO umount "$EXTRACT_DIR/dev" 2>/dev/null || true
+    $SUDO umount "$EXTRACT_DIR/proc" 2>/dev/null || true
+    $SUDO umount "$EXTRACT_DIR/sys" 2>/dev/null || true
+}
+
 ### Validation
-echo "[AutoISO] Validating system requirements..."
+log_info "Validating system requirements..."
 
 # Check if running as root or with sudo
 if [ "$EUID" -eq 0 ]; then
     SUDO=""
 else
     SUDO="sudo"
-    echo "[AutoISO] Running with sudo privileges"
+    log_info "Running with sudo privileges"
 fi
 
 # Validate kernel files exist
 if [ ! -f "$KERNEL_FILE" ]; then
-    echo "[ERROR] Kernel file not found: $KERNEL_FILE"
+    log_error "Kernel file not found: $KERNEL_FILE"
     echo "Available kernels:"
     ls -la /boot/vmlinuz* 2>/dev/null || echo "No kernels found in /boot/"
     exit 1
 fi
 
 if [ ! -f "$INITRD_FILE" ]; then
-    echo "[ERROR] Initrd file not found: $INITRD_FILE"
+    log_error "Initrd file not found: $INITRD_FILE"
     echo "Available initrd files:"
     ls -la /boot/initrd* 2>/dev/null || echo "No initrd files found in /boot/"
     exit 1
 fi
 
-echo "[AutoISO] Using kernel: $KERNEL_FILE"
-echo "[AutoISO] Using initrd: $INITRD_FILE"
+log_info "Using kernel: $KERNEL_FILE"
+log_info "Using initrd: $INITRD_FILE"
 
-# Check available disk space (minimum 12GB recommended due to duplication during build)
-AVAILABLE_SPACE=$(df /tmp | awk 'NR==2 {print $4}')
-AVAILABLE_GB=$((AVAILABLE_SPACE / 1024 / 1024))
-echo "[AutoISO] Available space in /tmp: ${AVAILABLE_GB}GB"
+# Check available disk space (minimum 15GB recommended for safety)
+log_info "Checking disk space requirements..."
+echo "Work directory location: $WORKDIR"
+echo "Disk info: $(df -h "$WORKDIR" 2>/dev/null | tail -1 || echo "Path not accessible")"
 
-if [ "$AVAILABLE_SPACE" -lt 12582912 ]; then
-    echo "[ERROR] Insufficient space! Need at least 12GB, have ${AVAILABLE_GB}GB"
-    echo "Free up space or change WORKDIR to a location with more space:"
-    echo "  export WORKDIR=/path/to/larger/disk/iso"
-    echo "  $0"
+# Create work directory if it doesn't exist
+if [ ! -d "$WORKDIR" ]; then
+    log_info "Creating work directory: $WORKDIR"
+    mkdir -p "$WORKDIR" || {
+        log_error "Cannot create work directory: $WORKDIR"
+        echo "Please check permissions or choose a different location."
+        exit 1
+    }
+fi
+
+if ! check_space 15; then
+    echo ""
+    echo "=== Disk Space Solutions ==="
+    echo "1. Use a different disk:"
+    echo "   $0 /path/to/larger/disk"
+    echo ""
+    echo "2. Set environment variable:"
+    echo "   export WORKDIR=/path/to/larger/disk/autoiso-work"
+    echo "   $0"
+    echo ""
+    echo "3. Clean up current location:"
+    echo "   sudo rm -rf $WORKDIR"
+    echo "   # Then run the script again"
     exit 1
 fi
 
 ### Cleanup
-echo "[AutoISO] Cleaning old build..."
+log_info "Cleaning old build..."
 $SUDO rm -rf "$WORKDIR"
 mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
 
 ### Dependencies
-echo "[AutoISO] Installing required packages..."
-$SUDO apt-get update
+log_info "Installing required packages..."
+$SUDO apt-get update -qq
 $SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools
 
 ### Copy system files
-echo "[AutoISO] Copying system files (this may take several minutes)..."
-
-# Check initial space
-SPACE_BEFORE=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
-echo "[AutoISO] Space before copy: $((SPACE_BEFORE / 1024 / 1024))GB"
+log_info "Copying system files (this may take several minutes)..."
 
 EXCLUDE_ARGS=()
 for dir in "${EXCLUDE_DIRS[@]}"; do
     EXCLUDE_ARGS+=(--exclude="$dir")
 done
 
-# More conservative rsync options to handle space constraints
+# Enhanced rsync options for better compression and reliability
 RSYNC_OPTS=(
     -a                    # Archive mode
     --progress           # Show progress
@@ -131,58 +248,62 @@ RSYNC_OPTS=(
     --numeric-ids        # Don't map uid/gid values by user/group name
     --one-file-system    # Don't cross filesystem boundaries
     --compress           # Compress during transfer
+    --compress-level=6   # Higher compression
     --prune-empty-dirs   # Don't create empty directories
+    --delete-excluded    # Delete excluded files from destination
 )
 
 # Copy with better error handling and space monitoring
-echo "[AutoISO] Starting system copy with space monitoring..."
+log_info "Starting system copy with space monitoring..."
 if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
-    echo "[WARNING] Some files failed to copy due to space or permission issues"
+    log_warning "Some files failed to copy due to space or permission issues"
     
-    # Check remaining space
-    SPACE_AFTER=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
-    echo "[AutoISO] Space after copy attempt: $((SPACE_AFTER / 1024 / 1024))GB"
-    
-    if [ "$SPACE_AFTER" -lt 1048576 ]; then  # Less than 1GB
-        echo "[ERROR] Insufficient space to continue. Please:"
-        echo "1. Free up space in $WORKDIR"
-        echo "2. Or set WORKDIR to a location with more space:"
-        echo "   export WORKDIR=/path/to/larger/disk"
+    if ! check_space 3; then
+        echo ""
+        echo "=== Space Recovery Options ==="
+        echo "1. Move to larger disk:"
+        echo "   sudo rm -rf $WORKDIR"
+        echo "   $0 /path/to/larger/disk"
+        echo ""
+        echo "2. Clean current build and retry:"
+        echo "   sudo rm -rf $WORKDIR"
         echo "   $0"
         exit 1
     fi
 fi
 
+### Post-copy cleanup and fixes
+log_info "Performing post-copy cleanup..."
+
+# Fix any broken symlinks
+log_info "Fixing broken symbolic links..."
+if [ -d "$EXTRACT_DIR" ]; then
+    $SUDO find "$EXTRACT_DIR" -type l 2>/dev/null | while IFS= read -r link; do
+        if [ ! -e "$link" ]; then
+            echo "Removing broken symlink: $link"
+            $SUDO rm -f "$link" 2>/dev/null || true
+        fi
+    done
+fi
+
+# Ensure essential directories exist
+log_info "Creating essential directories..."
+$SUDO mkdir -p "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys" "$EXTRACT_DIR/run" "$EXTRACT_DIR/tmp" "$EXTRACT_DIR/var/tmp"
+$SUDO chmod 1777 "$EXTRACT_DIR/tmp" 2>/dev/null || true
+$SUDO chmod 1777 "$EXTRACT_DIR/var/tmp" 2>/dev/null || true
+
 ### Prepare chroot environment
-echo "[AutoISO] Preparing chroot environment..."
+log_info "Preparing chroot environment..."
 $SUDO mount --bind /dev "$EXTRACT_DIR/dev"
 $SUDO mount --bind /proc "$EXTRACT_DIR/proc"
 $SUDO mount --bind /sys "$EXTRACT_DIR/sys"
 $SUDO mount --bind /dev/pts "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
 
-# Function to cleanup mounts on exit
-cleanup_mounts() {
-    echo "[AutoISO] Cleaning up mounts..."
-    $SUDO umount "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/dev" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/proc" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/sys" 2>/dev/null || true
-}
+# Set trap for cleanup
 trap cleanup_mounts EXIT
 
 ### Configure chroot environment
-echo "[AutoISO] Configuring live system..."
-
-# Monitor disk space during chroot operations
-check_space() {
-    local space=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
-    local space_gb=$((space / 1024 / 1024))
-    if [ "$space" -lt 2097152 ]; then  # Less than 2GB
-        echo "[ERROR] Running low on space: ${space_gb}GB remaining"
-        return 1
-    fi
-    return 0
-}
+log_info "Configuring live system..."
 
 # Simplified chroot configuration to avoid debconf issues
 $SUDO chroot "$EXTRACT_DIR" bash -c "
@@ -192,7 +313,7 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
     export LANG=C
     
     # Update package lists
-    apt-get update || true
+    apt-get update -qq || true
     
     # Install live-boot without debconf prompts
     apt-get install -y --no-install-recommends live-boot live-boot-initramfs-tools || true
@@ -201,19 +322,42 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
     if ! id -u user >/dev/null 2>&1; then
         useradd -m -s /bin/bash -G sudo user || true
         echo 'user:live' | chpasswd || true
+        # Set up basic user environment
+        mkdir -p /home/user/{Desktop,Documents,Downloads,Pictures,Videos} || true
+        chown -R user:user /home/user || true
     fi
     
+    # Install useful packages for live environment
+    apt-get install -y --no-install-recommends \
+        network-manager \
+        wireless-tools \
+        wpasupplicant \
+        firefox-esr \
+        file-manager-pcmanfm \
+        nano \
+        htop || true
+    
+    # Enable NetworkManager
+    systemctl enable NetworkManager || true
+    
     # Clean up to save space
+    apt-get autoremove -y || true
+    apt-get autoclean || true
     apt-get clean || true
     rm -rf /var/lib/apt/lists/* || true
     rm -rf /var/cache/apt/* || true
     rm -rf /tmp/* || true
     rm -rf /var/tmp/* || true
+    rm -rf /var/log/*.log || true
+    
+    # Clear bash history
+    history -c || true
+    rm -f /root/.bash_history /home/*/bash_history || true
 "
 
 # Check space after chroot operations
-if ! check_space; then
-    echo "[ERROR] Not enough space to continue"
+if ! check_space 2; then
+    log_error "Not enough space to continue after chroot configuration"
     exit 1
 fi
 
@@ -221,15 +365,16 @@ fi
 cleanup_mounts
 trap - EXIT
 
-### Clean problematic files
-echo "[AutoISO] Cleaning up problematic files..."
+### Advanced cleanup
+log_info "Performing advanced cleanup..."
+
+# Remove large log files
 $SUDO find "$EXTRACT_DIR" -name "*.log" -size +10M -delete 2>/dev/null || true
 $SUDO find "$EXTRACT_DIR" -type f -path "*/var/cache/*" -delete 2>/dev/null || true
 
-# Remove files with paths longer than ISO9660 limit (more aggressive cleanup)
-echo "[AutoISO] Removing files with long paths..."
+# Remove files with paths longer than ISO9660 limit
+log_info "Removing files with long paths..."
 $SUDO find "$EXTRACT_DIR" -type f | while IFS= read -r file; do
-    # Calculate relative path from extract dir
     rel_path="${file#$EXTRACT_DIR/}"
     if [[ ${#rel_path} -gt 180 ]]; then
         echo "Removing long path: $rel_path"
@@ -237,7 +382,7 @@ $SUDO find "$EXTRACT_DIR" -type f | while IFS= read -r file; do
     fi
 done
 
-# Remove problematic directories that often cause issues
+# Remove problematic directories
 PROBLEMATIC_DIRS=(
     "$EXTRACT_DIR/var/lib/docker"
     "$EXTRACT_DIR/var/lib/containerd"
@@ -246,50 +391,51 @@ PROBLEMATIC_DIRS=(
     "$EXTRACT_DIR/usr/src"
     "$EXTRACT_DIR/var/lib/apt/lists"
     "$EXTRACT_DIR/var/cache"
-    "$EXTRACT_DIR/tmp"
-    "$EXTRACT_DIR/var/tmp"
     "$EXTRACT_DIR/root/.cache"
-    "$EXTRACT_DIR/home/*/.cache"
-    "$EXTRACT_DIR/home/*/.local/share/Trash"
-    "$EXTRACT_DIR/home/*/.mozilla/firefox/*/cache2"
-    "$EXTRACT_DIR/home/*/.config/google-chrome/*/Cache"
+    "$EXTRACT_DIR/var/lib/flatpak"
+    "$EXTRACT_DIR/var/lib/snapd"
 )
 
 for dir_pattern in "${PROBLEMATIC_DIRS[@]}"; do
-    if [[ "$dir_pattern" == *"*"* ]]; then
-        # Handle glob patterns
-        for dir in $dir_pattern; do
-            if [[ -d "$dir" ]]; then
-                echo "Removing problematic directory: $dir"
-                $SUDO rm -rf "$dir" 2>/dev/null || true
-            fi
-        done
-    else
-        if [[ -d "$dir_pattern" ]]; then
-            echo "Removing problematic directory: $dir_pattern"
-            $SUDO rm -rf "$dir_pattern" 2>/dev/null || true
-        fi
+    if [[ -d "$dir_pattern" ]]; then
+        log_info "Removing problematic directory: $dir_pattern"
+        $SUDO rm -rf "$dir_pattern" 2>/dev/null || true
     fi
 done
 
+# Remove user cache directories
+$SUDO find "$EXTRACT_DIR/home" -type d -name ".cache" -exec rm -rf {} + 2>/dev/null || true
+$SUDO find "$EXTRACT_DIR/home" -type d -path "*/.mozilla/firefox/*/cache2" -exec rm -rf {} + 2>/dev/null || true
+$SUDO find "$EXTRACT_DIR/home" -type d -path "*/.config/google-chrome/*/Cache" -exec rm -rf {} + 2>/dev/null || true
+
 ### Create SquashFS filesystem
-echo "[AutoISO] Creating SquashFS filesystem (this may take several minutes)..."
+log_info "Creating SquashFS filesystem (this may take several minutes)..."
+
+# Check space before squashfs creation
+if ! check_space 4; then
+    log_error "Insufficient space for SquashFS creation"
+    exit 1
+fi
+
 $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
     -e boot \
     -no-exports \
     -noappend \
     -comp xz \
-    -processors $(nproc)
+    -Xbcj x86 \
+    -b 1M \
+    -processors $(nproc) \
+    -progress
 
 ### Copy kernel and initrd
-echo "[AutoISO] Copying kernel and initrd files..."
+log_info "Copying kernel and initrd files..."
 $SUDO cp "$KERNEL_FILE" "$CDROOT_DIR/live/vmlinuz"
 $SUDO cp "$INITRD_FILE" "$CDROOT_DIR/live/initrd"
 
 ### Setup ISOLINUX bootloader
-echo "[AutoISO] Setting up ISOLINUX bootloader..."
+log_info "Setting up ISOLINUX bootloader..."
 
-# Find correct isolinux paths (different distributions use different locations)
+# Find correct isolinux paths
 ISOLINUX_BIN=""
 SYSLINUX_MODULES=""
 
@@ -308,7 +454,7 @@ for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux; do
 done
 
 if [ -z "$ISOLINUX_BIN" ]; then
-    echo "[ERROR] isolinux.bin not found. Please install isolinux package."
+    log_error "isolinux.bin not found. Please install isolinux package."
     exit 1
 fi
 
@@ -321,66 +467,84 @@ if [ -n "$SYSLINUX_MODULES" ]; then
 fi
 
 ### Create boot configuration
-echo "[AutoISO] Creating boot menu configuration..."
+log_info "Creating boot menu configuration..."
 cat <<EOF | $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null
 UI menu.c32
 PROMPT 0
 MENU TITLE AutoISO Persistent Live System
-TIMEOUT 50
+MENU BACKGROUND splash.png
+TIMEOUT 100
 DEFAULT persistent
 
 LABEL persistent
-  MENU LABEL AutoISO Persistent Mode
+  MENU LABEL ^AutoISO Persistent Mode (Recommended)
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components persistence persistent=cryptsetup,removable quiet splash
+  APPEND initrd=/live/initrd boot=live components persistence persistent=cryptsetup,removable quiet splash noswap
 
 LABEL live
-  MENU LABEL AutoISO Live Mode (No Persistence)
+  MENU LABEL AutoISO ^Live Mode (No Persistence)
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components quiet splash
+  APPEND initrd=/live/initrd boot=live components quiet splash noswap
 
-LABEL memtest
-  MENU LABEL Memory Test
+LABEL live-safe
+  MENU LABEL AutoISO ^Safe Mode
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components memtest
+  APPEND initrd=/live/initrd boot=live components quiet splash noswap nomodeset
+
+LABEL live-toram
+  MENU LABEL AutoISO to ^RAM (Requires 4GB+ RAM)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components toram quiet splash noswap
 
 MENU SEPARATOR
 
 LABEL reboot
-  MENU LABEL Reboot
+  MENU LABEL ^Reboot Computer
   COM32 reboot.c32
 
 LABEL poweroff
-  MENU LABEL Power Off
+  MENU LABEL ^Power Off Computer
   COM32 poweroff.c32
 EOF
 
 ### Create additional boot files
-echo "[AutoISO] Creating additional configuration files..."
-
-# Create isolinux boot catalog
+log_info "Creating additional configuration files..."
 $SUDO touch "$CDROOT_DIR/boot/isolinux/boot.cat"
 
 ### Build final ISO
-echo "[AutoISO] Building final ISO image..."
+log_info "Building final ISO image..."
 cd "$CDROOT_DIR"
 
-# Use more compatible ISO creation with filename length handling
+# Final space check
+if ! check_space 1; then
+    log_error "Insufficient space for ISO creation"
+    exit 1
+fi
+
+# Create ISO with enhanced options
 $SUDO genisoimage \
     -o "$WORKDIR/$ISO_NAME" \
     -b boot/isolinux/isolinux.bin \
     -c boot/isolinux/boot.cat \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
-    -J -R -l -V "AutoISO" \
+    -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
     -allow-leading-dots \
     -relaxed-filenames \
     -allow-lowercase \
     -allow-multidot \
     -max-iso9660-filenames \
+    -joliet-long \
+    -full-iso9660-filenames \
     .
 
 # Make ISO readable by user
 $SUDO chmod 644 "$WORKDIR/$ISO_NAME"
+
+# Verify ISO integrity
+log_info "Verifying ISO integrity..."
+if command -v isoinfo >/dev/null 2>&1; then
+    isoinfo -d -i "$WORKDIR/$ISO_NAME" >/dev/null 2>&1 && log_info "ISO integrity check passed" || log_warning "ISO integrity check failed"
+fi
 
 echo ""
 echo "=========================="
@@ -393,24 +557,34 @@ echo "=== DISK SPACE USAGE ==="
 echo "Work directory: $(du -sh "$WORKDIR" | cut -f1)"
 FINAL_SPACE=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
 echo "Remaining space: $((FINAL_SPACE / 1024 / 1024))GB"
+echo "Disk: $(df -h "$WORKDIR" | awk 'NR==2 {print $1}')"
 echo ""
 echo "=== USAGE INSTRUCTIONS ==="
 echo ""
-echo "1. Write ISO to USB drive:"
-echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress && sync"
-echo "   (Replace /dev/sdX with your USB device)"
+echo "1. Write ISO to USB drive (CAREFUL - THIS WILL ERASE THE USB!):"
+echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress oflag=sync"
+echo "   (Replace /dev/sdX with your USB device - use 'lsblk' to identify)"
 echo ""
-echo "2. Create persistence partition:"
+echo "2. Create persistence partition (OPTIONAL for persistent mode):"
 echo "   a) Use gparted or fdisk to create a second partition on the USB"
 echo "   b) Format it as ext4: sudo mkfs.ext4 -L persistence /dev/sdX2"
-echo "   c) Mount it: sudo mount /dev/sdX2 /mnt"
-echo "   d) Create persistence.conf: echo '/ union' | sudo tee /mnt/persistence.conf"
-echo "   e) Unmount: sudo umount /mnt"
+echo "   c) Mount it: sudo mkdir -p /mnt/persistence && sudo mount /dev/sdX2 /mnt/persistence"
+echo "   d) Create persistence.conf: echo '/ union' | sudo tee /mnt/persistence/persistence.conf"
+echo "   e) Unmount: sudo umount /mnt/persistence"
 echo ""
-echo "3. Boot from USB and select 'AutoISO Persistent Mode'"
+echo "3. Boot Options:"
+echo "   - Persistent Mode: Your changes are saved between reboots"
+echo "   - Live Mode: No changes are saved (traditional live CD)"
+echo "   - Safe Mode: Use if you have graphics issues"
+echo "   - To RAM: Loads entire system to RAM for faster operation"
 echo ""
-echo "Note: Changes will be saved to the persistence partition automatically."
+echo "Default login: user / live (user has sudo privileges)"
 echo ""
 echo "=== CLEANUP ==="
 echo "To free up space, run: sudo rm -rf $WORKDIR"
+echo ""
+echo "=== FUTURE RUNS ==="
+echo "To use this same location again:"
+echo "  $0 $(dirname "$WORKDIR")"
+echo "Or set: export WORKDIR=$WORKDIR"
 echo "=============================="
