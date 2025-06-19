@@ -1,4 +1,18 @@
-#!/bin/bash
+### Post-copy cleanup and fixes
+echo "[AutoISO] Performing post-copy cleanup..."
+
+# Fix any broken symlinks
+echo "[AutoISO] Fixing broken symbolic links..."
+$SUDO find "$EXTRACT_DIR" -type l | while read -r link; do
+    if [[ ! -e "$link" ]]; then
+        echo "Removing broken symlink: $link"
+        $SUDO rm -f "$link" 2>/dev/null || true
+    fi
+done
+
+# Ensure essential directories exist
+$SUDO mkdir -p "$EXTRACT_DIR"/{dev,proc,sys,run,tmp,var/tmp}
+$SUDO chmod 1777 "$EXTRACT_DIR/tmp" "$EXTRACT_DIR/var/tmp"#!/bin/bash
 # ========================================
 #         A U T O M A T E D   I S O        
 # ========================================
@@ -30,6 +44,8 @@ EXCLUDE_DIRS=(
     "/var/lib/docker/*" "/var/lib/containerd/*" "/snap/*" "/var/snap/*"
     "/usr/src/*" "/var/lib/apt/lists/*" "/root/.cache/*"
     "/swapfile" "/pagefile.sys" "*.log" "/var/crash/*"
+    "/var/lib/lxcfs/*" "/var/lib/systemd/coredump/*"
+    "/var/spool/*" "/var/backups/*" "/boot/efi/*"
 )
 
 ### Validation
@@ -61,10 +77,16 @@ fi
 echo "[AutoISO] Using kernel: $KERNEL_FILE"
 echo "[AutoISO] Using initrd: $INITRD_FILE"
 
-# Check available disk space (minimum 4GB recommended)
+# Check available disk space (minimum 8GB recommended due to duplication during build)
 AVAILABLE_SPACE=$(df /tmp | awk 'NR==2 {print $4}')
-if [[ $AVAILABLE_SPACE -lt 4194304 ]]; then
-    echo "[WARNING] Less than 4GB available in /tmp. Consider freeing space or changing WORKDIR."
+if [[ $AVAILABLE_SPACE -lt 8388608 ]]; then
+    echo "[WARNING] Less than 8GB available in /tmp. Consider freeing space or changing WORKDIR."
+    echo "Available space: $(( AVAILABLE_SPACE / 1024 / 1024 ))GB"
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
 fi
 
 ### Cleanup
@@ -84,8 +106,27 @@ for dir in "${EXCLUDE_DIRS[@]}"; do
     EXCLUDE_ARGS+=(--exclude="$dir")
 done
 
-# Use progress indicator for rsync
-$SUDO rsync -aAXH --progress "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR"
+# Additional rsync options to handle problematic files
+RSYNC_OPTS=(
+    -a                    # Archive mode
+    --progress           # Show progress
+    --partial            # Keep partially transferred files
+    --ignore-errors      # Don't stop on errors
+    --force              # Force deletion of directories even if not empty
+    --delete-excluded    # Delete excluded files from destination
+    --numeric-ids        # Don't map uid/gid values by user/group name
+    --one-file-system    # Don't cross filesystem boundaries
+)
+
+# Copy with better error handling
+echo "[AutoISO] Starting system copy with error resilience..."
+if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
+    echo "[WARNING] Some files failed to copy, but continuing..."
+    echo "[AutoISO] Attempting second pass to catch missed files..."
+    
+    # Second pass with even more permissive options
+    $SUDO rsync -av --progress --ignore-errors --partial "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/" || true
+fi
 
 ### Prepare chroot environment
 echo "[AutoISO] Preparing chroot environment..."
