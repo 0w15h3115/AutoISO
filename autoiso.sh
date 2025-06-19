@@ -29,7 +29,8 @@ fi
 set -e
 
 ### Configuration
-WORKDIR=/tmp/iso
+# Allow override of work directory via environment variable
+WORKDIR=${WORKDIR:-/tmp/iso}
 EXTRACT_DIR="$WORKDIR/extract"
 CDROOT_DIR="$WORKDIR/cdroot"
 ISO_NAME="autoiso-persistent-$(date +%Y%m%d).iso"
@@ -86,16 +87,17 @@ fi
 echo "[AutoISO] Using kernel: $KERNEL_FILE"
 echo "[AutoISO] Using initrd: $INITRD_FILE"
 
-# Check available disk space (minimum 8GB recommended due to duplication during build)
+# Check available disk space (minimum 12GB recommended due to duplication during build)
 AVAILABLE_SPACE=$(df /tmp | awk 'NR==2 {print $4}')
-if [ "$AVAILABLE_SPACE" -lt 8388608 ]; then
-    echo "[WARNING] Less than 8GB available in /tmp. Consider freeing space or changing WORKDIR."
-    echo "Available space: $(( AVAILABLE_SPACE / 1024 / 1024 ))GB"
-    read -p "Continue anyway? (y/N): " -n 1 -r
-    echo
-    if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
-        exit 1
-    fi
+AVAILABLE_GB=$((AVAILABLE_SPACE / 1024 / 1024))
+echo "[AutoISO] Available space in /tmp: ${AVAILABLE_GB}GB"
+
+if [ "$AVAILABLE_SPACE" -lt 12582912 ]; then
+    echo "[ERROR] Insufficient space! Need at least 12GB, have ${AVAILABLE_GB}GB"
+    echo "Free up space or change WORKDIR to a location with more space:"
+    echo "  export WORKDIR=/path/to/larger/disk/iso"
+    echo "  $0"
+    exit 1
 fi
 
 ### Cleanup
@@ -110,31 +112,45 @@ $SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-t
 
 ### Copy system files
 echo "[AutoISO] Copying system files (this may take several minutes)..."
+
+# Check initial space
+SPACE_BEFORE=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
+echo "[AutoISO] Space before copy: $((SPACE_BEFORE / 1024 / 1024))GB"
+
 EXCLUDE_ARGS=()
 for dir in "${EXCLUDE_DIRS[@]}"; do
     EXCLUDE_ARGS+=(--exclude="$dir")
 done
 
-# Additional rsync options to handle problematic files
+# More conservative rsync options to handle space constraints
 RSYNC_OPTS=(
     -a                    # Archive mode
     --progress           # Show progress
     --partial            # Keep partially transferred files
     --ignore-errors      # Don't stop on errors
-    --force              # Force deletion of directories even if not empty
-    --delete-excluded    # Delete excluded files from destination
     --numeric-ids        # Don't map uid/gid values by user/group name
     --one-file-system    # Don't cross filesystem boundaries
+    --compress           # Compress during transfer
+    --prune-empty-dirs   # Don't create empty directories
 )
 
-# Copy with better error handling
-echo "[AutoISO] Starting system copy with error resilience..."
+# Copy with better error handling and space monitoring
+echo "[AutoISO] Starting system copy with space monitoring..."
 if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
-    echo "[WARNING] Some files failed to copy, but continuing..."
-    echo "[AutoISO] Attempting second pass to catch missed files..."
+    echo "[WARNING] Some files failed to copy due to space or permission issues"
     
-    # Second pass with even more permissive options
-    $SUDO rsync -av --progress --ignore-errors --partial "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/" || true
+    # Check remaining space
+    SPACE_AFTER=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
+    echo "[AutoISO] Space after copy attempt: $((SPACE_AFTER / 1024 / 1024))GB"
+    
+    if [ "$SPACE_AFTER" -lt 1048576 ]; then  # Less than 1GB
+        echo "[ERROR] Insufficient space to continue. Please:"
+        echo "1. Free up space in $WORKDIR"
+        echo "2. Or set WORKDIR to a location with more space:"
+        echo "   export WORKDIR=/path/to/larger/disk"
+        echo "   $0"
+        exit 1
+    fi
 fi
 
 ### Prepare chroot environment
@@ -156,30 +172,50 @@ trap cleanup_mounts EXIT
 
 ### Configure chroot environment
 echo "[AutoISO] Configuring live system..."
+
+# Monitor disk space during chroot operations
+check_space() {
+    local space=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
+    local space_gb=$((space / 1024 / 1024))
+    if [ "$space" -lt 2097152 ]; then  # Less than 2GB
+        echo "[ERROR] Running low on space: ${space_gb}GB remaining"
+        return 1
+    fi
+    return 0
+}
+
+# Simplified chroot configuration to avoid debconf issues
 $SUDO chroot "$EXTRACT_DIR" bash -c "
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y live-boot live-boot-initramfs-tools
+    export DEBCONF_NONINTERACTIVE_SEEN=true
+    export LC_ALL=C
+    export LANG=C
     
-    # Configure live-boot
-    echo 'live-boot live-boot/username string user' | debconf-set-selections
+    # Update package lists
+    apt-get update || true
     
-    # Clean package cache
-    apt-get clean
+    # Install live-boot without debconf prompts
+    apt-get install -y --no-install-recommends live-boot live-boot-initramfs-tools || true
     
-    # Remove unnecessary files
-    rm -rf /var/lib/apt/lists/*
-    rm -rf /var/cache/apt/*
-    rm -rf /tmp/*
-    rm -rf /var/tmp/*
-    
-    # Create live user if it doesn't exist
-    if ! id -u user &>/dev/null; then
-        useradd -m -s /bin/bash user
-        echo 'user:live' | chpasswd
-        usermod -aG sudo user
+    # Create live user without debconf
+    if ! id -u user >/dev/null 2>&1; then
+        useradd -m -s /bin/bash -G sudo user || true
+        echo 'user:live' | chpasswd || true
     fi
+    
+    # Clean up to save space
+    apt-get clean || true
+    rm -rf /var/lib/apt/lists/* || true
+    rm -rf /var/cache/apt/* || true
+    rm -rf /tmp/* || true
+    rm -rf /var/tmp/* || true
 "
+
+# Check space after chroot operations
+if ! check_space; then
+    echo "[ERROR] Not enough space to continue"
+    exit 1
+fi
 
 # Cleanup mounts
 cleanup_mounts
@@ -353,6 +389,11 @@ echo "=========================="
 echo "ISO created at: $WORKDIR/$ISO_NAME"
 echo "Size: $(du -h "$WORKDIR/$ISO_NAME" | cut -f1)"
 echo ""
+echo "=== DISK SPACE USAGE ==="
+echo "Work directory: $(du -sh "$WORKDIR" | cut -f1)"
+FINAL_SPACE=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
+echo "Remaining space: $((FINAL_SPACE / 1024 / 1024))GB"
+echo ""
 echo "=== USAGE INSTRUCTIONS ==="
 echo ""
 echo "1. Write ISO to USB drive:"
@@ -369,4 +410,7 @@ echo ""
 echo "3. Boot from USB and select 'AutoISO Persistent Mode'"
 echo ""
 echo "Note: Changes will be saved to the persistence partition automatically."
+echo ""
+echo "=== CLEANUP ==="
+echo "To free up space, run: sudo rm -rf $WORKDIR"
 echo "=============================="
