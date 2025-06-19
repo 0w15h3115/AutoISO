@@ -3,16 +3,25 @@ echo "[AutoISO] Performing post-copy cleanup..."
 
 # Fix any broken symlinks
 echo "[AutoISO] Fixing broken symbolic links..."
-$SUDO find "$EXTRACT_DIR" -type l | while read -r link; do
-    if [[ ! -e "$link" ]]; then
-        echo "Removing broken symlink: $link"
-        $SUDO rm -f "$link" 2>/dev/null || true
-    fi
-done
+if [ -d "$EXTRACT_DIR" ]; then
+    $SUDO find "$EXTRACT_DIR" -type l 2>/dev/null | while IFS= read -r link; do
+        if [ ! -e "$link" ]; then
+            echo "Removing broken symlink: $link"
+            $SUDO rm -f "$link" 2>/dev/null || true
+        fi
+    done
+fi
 
 # Ensure essential directories exist
-$SUDO mkdir -p "$EXTRACT_DIR"/{dev,proc,sys,run,tmp,var/tmp}
-$SUDO chmod 1777 "$EXTRACT_DIR/tmp" "$EXTRACT_DIR/var/tmp"#!/bin/bash
+echo "[AutoISO] Creating essential directories..."
+$SUDO mkdir -p "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys" "$EXTRACT_DIR/run" "$EXTRACT_DIR/tmp" "$EXTRACT_DIR/var/tmp"
+$SUDO chmod 1777 "$EXTRACT_DIR/tmp" 2>/dev/null || true
+$SUDO chmod 1777 "$EXTRACT_DIR/var/tmp" 2>/dev/null || true#!/bin/bash
+# Ensure we're using bash
+if [ -z "$BASH_VERSION" ]; then
+    echo "This script requires bash. Please run with: bash $0"
+    exit 1
+fi
 # ========================================
 #         A U T O M A T E D   I S O        
 # ========================================
@@ -31,10 +40,10 @@ KERNEL_FILE="/boot/vmlinuz-$KERNEL_VERSION"
 INITRD_FILE="/boot/initrd.img-$KERNEL_VERSION"
 
 # Alternative kernel paths for different distributions
-if [[ ! -f "$KERNEL_FILE" ]]; then
+if [ ! -f "$KERNEL_FILE" ]; then
     KERNEL_FILE="/boot/vmlinuz"
 fi
-if [[ ! -f "$INITRD_FILE" ]]; then
+if [ ! -f "$INITRD_FILE" ]; then
     INITRD_FILE="/boot/initrd.img"
 fi
 
@@ -52,7 +61,7 @@ EXCLUDE_DIRS=(
 echo "[AutoISO] Validating system requirements..."
 
 # Check if running as root or with sudo
-if [[ $EUID -eq 0 ]]; then
+if [ "$EUID" -eq 0 ]; then
     SUDO=""
 else
     SUDO="sudo"
@@ -60,14 +69,14 @@ else
 fi
 
 # Validate kernel files exist
-if [[ ! -f "$KERNEL_FILE" ]]; then
+if [ ! -f "$KERNEL_FILE" ]; then
     echo "[ERROR] Kernel file not found: $KERNEL_FILE"
     echo "Available kernels:"
     ls -la /boot/vmlinuz* 2>/dev/null || echo "No kernels found in /boot/"
     exit 1
 fi
 
-if [[ ! -f "$INITRD_FILE" ]]; then
+if [ ! -f "$INITRD_FILE" ]; then
     echo "[ERROR] Initrd file not found: $INITRD_FILE"
     echo "Available initrd files:"
     ls -la /boot/initrd* 2>/dev/null || echo "No initrd files found in /boot/"
@@ -79,12 +88,12 @@ echo "[AutoISO] Using initrd: $INITRD_FILE"
 
 # Check available disk space (minimum 8GB recommended due to duplication during build)
 AVAILABLE_SPACE=$(df /tmp | awk 'NR==2 {print $4}')
-if [[ $AVAILABLE_SPACE -lt 8388608 ]]; then
+if [ "$AVAILABLE_SPACE" -lt 8388608 ]; then
     echo "[WARNING] Less than 8GB available in /tmp. Consider freeing space or changing WORKDIR."
     echo "Available space: $(( AVAILABLE_SPACE / 1024 / 1024 ))GB"
     read -p "Continue anyway? (y/N): " -n 1 -r
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [ "$REPLY" != "y" ] && [ "$REPLY" != "Y" ]; then
         exit 1
     fi
 fi
@@ -249,20 +258,20 @@ ISOLINUX_BIN=""
 SYSLINUX_MODULES=""
 
 for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux; do
-    if [[ -f "$path/isolinux.bin" ]]; then
+    if [ -f "$path/isolinux.bin" ]; then
         ISOLINUX_BIN="$path/isolinux.bin"
         break
     fi
 done
 
 for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux; do
-    if [[ -d "$path" ]]; then
+    if [ -d "$path" ]; then
         SYSLINUX_MODULES="$path"
         break
     fi
 done
 
-if [[ -z "$ISOLINUX_BIN" ]]; then
+if [ -z "$ISOLINUX_BIN" ]; then
     echo "[ERROR] isolinux.bin not found. Please install isolinux package."
     exit 1
 fi
@@ -270,7 +279,7 @@ fi
 $SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
 
 # Copy syslinux modules
-if [[ -n "$SYSLINUX_MODULES" ]]; then
+if [ -n "$SYSLINUX_MODULES" ]; then
     $SUDO cp "$SYSLINUX_MODULES"/*.c32 "$CDROOT_DIR/boot/isolinux/" 2>/dev/null || true
     $SUDO cp "$SYSLINUX_MODULES"/*.com "$CDROOT_DIR/boot/isolinux/" 2>/dev/null || true
 fi
