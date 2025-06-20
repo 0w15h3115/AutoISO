@@ -1,4 +1,4 @@
-#!/bin/bash
+ #!/bin/bash
 # Ensure we're using bash
 if [ -z "$BASH_VERSION" ]; then
     echo "This script requires bash. Please run with: bash $0"
@@ -72,11 +72,11 @@ else
     echo ""
     echo "Recommendation: Choose a location with at least 15GB free space"
     echo ""
-    read -t 30 -p "Enter work directory path (or press Enter for /tmp/iso): " user_workdir || user_workdir=""
+    read -t 30 -p "Enter work directory path (or press Enter for /mnt): " user_workdir || user_workdir=""
     if [ -n "$user_workdir" ]; then
         WORKDIR="$user_workdir/autoiso-build"
     else
-        WORKDIR="/tmp/iso"
+        WORKDIR="/mnt"
     fi
 fi
 
