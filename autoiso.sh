@@ -293,22 +293,32 @@ RSYNC_OPTS=(
 
 # Copy with better error handling and space monitoring
 log_info "Starting system copy with space monitoring..."
-# Use rsync with progress bar instead of verbose output
+# Use rsync with improved progress bar showing useful information
 if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/" 2>&1 | while IFS= read -r line; do
-    # Filter out verbose progress lines and show a simple progress indicator
+    # Show useful progress information instead of just percentages
     if [[ "$line" =~ to-chk ]]; then
-        # Extract percentage if available, otherwise show a simple dot
-        if [[ "$line" =~ ([0-9]+%) ]]; then
-            echo -ne "\r[AutoISO] Copying system files... ${BASH_REMATCH[1]}"
-        else
-            echo -n "."
+        # Extract and show file count and transfer info
+        if [[ "$line" =~ ([0-9,]+) ]]; then
+            files_transferred="${BASH_REMATCH[1]}"
+            echo -ne "\r[AutoISO] Copying system files... ${files_transferred} files"
         fi
     elif [[ "$line" =~ ^[0-9]+% ]]; then
-        # Show percentage lines
+        # Show percentage with more context
         echo -ne "\r[AutoISO] Copying system files... $line"
+    elif [[ "$line" =~ ([0-9.]+[KMG]B/s) ]]; then
+        # Show transfer speed
+        speed="${BASH_REMATCH[1]}"
+        echo -ne "\r[AutoISO] Copying system files... $speed"
+    elif [[ "$line" =~ ([0-9.]+[KMG]B) ]]; then
+        # Show data transferred
+        data="${BASH_REMATCH[1]}"
+        echo -ne "\r[AutoISO] Copying system files... $data transferred"
     elif [[ "$line" =~ ^rsync: ]]; then
         # Show rsync errors/warnings
         echo -e "\n[WARNING] $line"
+    elif [[ "$line" =~ "sent" ]] && [[ "$line" =~ "received" ]]; then
+        # Show final summary
+        echo -e "\n[AutoISO] Transfer completed: $line"
     fi
 done; then
     echo -e "\n[AutoISO] System copy completed"
