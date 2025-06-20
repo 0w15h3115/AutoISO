@@ -1,8 +1,7 @@
 #!/bin/bash
 # Ensure we're using bash
 if [ -z "$BASH_VERSION" ]; then
-    echo "This script requires bash. Please run with: bash $0"
-    exit 1
+    fatal_error "This script requires bash. Please run with: bash $0"
 fi
 
 # ========================================
@@ -16,7 +15,7 @@ fi
 #   WORKDIR=/mnt/ssd/build ./autoiso.sh    # Environment variable
 #
 # REQUIREMENTS:
-#   - At least 15GB free space on target disk
+#   - At least 15GB free space on target disk   (10GB for the ISO, 5GB for the build)                   
 #   - Root/sudo privileges
 #   - Debian/Ubuntu-based system
 #
@@ -26,6 +25,19 @@ fi
 #   ./autoiso.sh /media/user/USB-DRIVE     # Use mounted USB drive
 #
 set -e
+set -o pipefail
+
+# Centralized fatal error handler
+fatal_error() {
+    local msg="$1"
+    echo "[FATAL] $msg" >&2
+    cleanup_mounts
+    echo "\nIf you need help, please check the log above or consult the README."
+    exit 1
+}
+
+# Trap for uncaught errors
+trap 'fatal_error "An unexpected error occurred."' ERR
 
 # Show help if requested
 if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
@@ -89,7 +101,7 @@ else
     echo "  /mnt/external-drive          # External drive"
     echo "  /media/$USER/USB-DRIVE       # USB drive"
     echo ""
-    read -p "Enter work directory path (or press Enter for /tmp/iso): " user_workdir
+    read -t 30 -p "Enter work directory path (or press Enter for /tmp/iso): " user_workdir || user_workdir=""
     if [ -n "$user_workdir" ]; then
         WORKDIR="$user_workdir/autoiso-build"
     else
@@ -146,19 +158,40 @@ log_warning() {
     echo "[WARNING] $1" >&2
 }
 
+# Early check for required commands
+REQUIRED_CMDS=(rsync xorriso genisoimage mksquashfs isoinfo realpath lsblk df awk grep tee stat find cp mkdir rm chmod mount umount sudo apt-get grub-efi-amd64-bin mtools)
+MISSING_CMDS=()
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        MISSING_CMDS+=("$cmd")
+    fi
+done
+if [ ${#MISSING_CMDS[@]} -ne 0 ]; then
+    fatal_error "Missing required commands: ${MISSING_CMDS[*]}\nPlease install the missing packages before running this script."
+fi
+
+# Check for sudo availability if not root
+if [ "$EUID" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        fatal_error "This script requires sudo privileges, but 'sudo' is not installed."
+    fi
+    if ! sudo -n true 2>/dev/null; then
+        fatal_error "This script requires sudo privileges. Please ensure your user can run sudo without a password prompt."
+    fi
+fi
+
 check_space() {
     local min_space_gb=${1:-2}
     local min_space_kb=$((min_space_gb * 1024 * 1024))
-    
     # Handle case where WORKDIR doesn't exist yet
     local check_dir="$WORKDIR"
     if [ ! -d "$WORKDIR" ]; then
         check_dir=$(dirname "$WORKDIR")
     fi
-    
     local space=$(df "$check_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
     local space_gb=$((space / 1024 / 1024))
-    
+    # Check for free inodes as well
+    local inodes=$(df -i "$check_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
     if [ "$space" -lt "$min_space_kb" ]; then
         log_error "Insufficient space in $check_dir: ${space_gb}GB available, ${min_space_gb}GB required"
         echo ""
@@ -172,15 +205,22 @@ check_space() {
         echo "  $0"
         return 1
     fi
-    log_info "Available space in $check_dir: ${space_gb}GB"
+    if [ "$inodes" -lt 10000 ]; then
+        log_error "Insufficient free inodes in $check_dir: $inodes available, at least 10000 required."
+        echo "Consider cleaning up files or using a different location."
+        return 1
+    fi
+    log_info "Available space in $check_dir: ${space_gb}GB, free inodes: $inodes"
     return 0
 }
 
 cleanup_mounts() {
     log_info "Cleaning up mounts..."
     for mount_point in "$EXTRACT_DIR/dev/pts" "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys"; do
-        if mountpoint -q "$mount_point" 2>/dev/null; then
-            $SUDO umount "$mount_point" 2>/dev/null || true
+        if [ -d "$mount_point" ]; then
+            if mountpoint -q "$mount_point" 2>/dev/null; then
+                $SUDO umount "$mount_point" 2>/dev/null || true
+            fi
         fi
     done
 }
@@ -221,8 +261,7 @@ fi
 # Validate essential system directories exist
 for essential_dir in /boot /etc /usr /var; do
     if [ ! -d "$essential_dir" ]; then
-        log_error "Essential directory $essential_dir not found. Cannot proceed."
-        exit 1
+        fatal_error "Essential directory $essential_dir not found. Cannot proceed."
     fi
 done
 
@@ -231,14 +270,14 @@ if [ ! -f "$KERNEL_FILE" ]; then
     log_error "Kernel file not found: $KERNEL_FILE"
     echo "Available kernels:"
     ls -la /boot/vmlinuz* 2>/dev/null || echo "No kernels found in /boot/"
-    exit 1
+    fatal_error "Kernel file not found."
 fi
 
 if [ ! -f "$INITRD_FILE" ]; then
     log_error "Initrd file not found: $INITRD_FILE"
     echo "Available initrd files:"
     ls -la /boot/initrd* 2>/dev/null || echo "No initrd files found in /boot/"
-    exit 1
+    fatal_error "Initrd file not found."
 fi
 
 log_info "Using kernel: $KERNEL_FILE"
@@ -251,14 +290,16 @@ echo "Work directory location: $WORKDIR"
 # Create work directory if it doesn't exist
 if [ ! -d "$WORKDIR" ]; then
     log_info "Creating work directory: $WORKDIR"
-    mkdir -p "$WORKDIR" || {
-        log_error "Cannot create work directory: $WORKDIR"
-        echo "Please check permissions or choose a different location."
-        exit 1
-    }
+    mkdir -p "$WORKDIR" || fatal_error "Cannot create work directory: $WORKDIR\nPlease check permissions or choose a different location."
 fi
 
 echo "Disk info: $(df -h "$WORKDIR" 2>/dev/null | tail -1 || echo "Path not accessible")"
+
+# Filesystem type check for workdir
+fs_type=$(df -T "$WORKDIR" | awk 'NR==2 {print $2}')
+if [[ "$fs_type" =~ ^(vfat|exfat|ntfs)$ ]]; then
+    fatal_error "Work directory is on $fs_type, which may not support all required features. Use ext4 or another Linux filesystem."
+fi
 
 if ! check_space 15; then
     echo ""
@@ -273,7 +314,7 @@ if ! check_space 15; then
     echo "3. Clean up current location:"
     echo "   sudo rm -rf $WORKDIR"
     echo "   # Then run the script again"
-    exit 1
+    fatal_error "Insufficient disk space."
 fi
 
 ### Cleanup
@@ -284,7 +325,7 @@ mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
 ### Dependencies
 log_info "Installing required packages..."
 $SUDO apt-get update -qq
-$SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools
+$SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools grub-efi-amd64-bin mtools
 
 ### Copy system files
 log_info "Copying system files (this may take several minutes)..."
@@ -323,7 +364,7 @@ if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
         echo "2. Clean current build and retry:"
         echo "   sudo rm -rf $WORKDIR"
         echo "   $0"
-        exit 1
+        fatal_error "Insufficient disk space during rsync."
     fi
 fi
 
@@ -354,8 +395,8 @@ $SUDO mount --bind /proc "$EXTRACT_DIR/proc"
 $SUDO mount --bind /sys "$EXTRACT_DIR/sys"
 $SUDO mount --bind /dev/pts "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
 
-# Set trap for cleanup
-trap cleanup_mounts EXIT
+# Trap for cleanup on EXIT, INT, TERM (set early)
+trap cleanup_mounts EXIT INT TERM
 
 ### Configure chroot environment
 log_info "Configuring live system..."
@@ -429,12 +470,15 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
     # Clear bash history
     history -c 2>/dev/null || true
     rm -f /root/.bash_history /home/*/bash_history 2>/dev/null || true
+
+    if ! dpkg -l | grep -q live-boot; then
+        echo '[WARNING] live-boot package not found after install!' >&2
+    fi
 "
 
 # Check space after chroot operations
 if ! check_space 2; then
-    log_error "Not enough space to continue after chroot configuration"
-    exit 1
+    fatal_error "Not enough space to continue after chroot configuration"
 fi
 
 # Cleanup mounts
@@ -489,8 +533,7 @@ log_info "Creating SquashFS filesystem (this may take several minutes)..."
 
 # Check space before squashfs creation
 if ! check_space 4; then
-    log_error "Insufficient space for SquashFS creation"
-    exit 1
+    fatal_error "Insufficient space for SquashFS creation"
 fi
 
 # Enhanced SquashFS compression options to reduce size
@@ -553,13 +596,13 @@ done
 if [ -z "$ISOLINUX_BIN" ]; then
     log_error "isolinux.bin not found. Please install isolinux package."
     echo "Searched in: /usr/lib/isolinux, /usr/lib/ISOLINUX, /usr/share/isolinux"
-    exit 1
+    fatal_error "isolinux.bin not found."
 fi
 
 if [ -z "$ISOHDPFX_BIN" ]; then
     log_error "isohdpfx.bin not found. Please install isolinux package."
     echo "Searched in: /usr/lib/isolinux, /usr/lib/ISOLINUX, /usr/share/isolinux, /usr/lib/syslinux/mbr"
-    exit 1
+    fatal_error "isohdpfx.bin not found."
 fi
 
 log_info "Found isolinux.bin: $ISOLINUX_BIN"
@@ -622,10 +665,14 @@ $SUDO touch "$CDROOT_DIR/boot/isolinux/boot.cat"
 log_info "Building final ISO image..."
 cd "$CDROOT_DIR"
 
+# Before building the ISO, check if the output ISO file already exists
+if [ -f "$WORKDIR/$ISO_NAME" ]; then
+    fatal_error "Output ISO file $WORKDIR/$ISO_NAME already exists. Please remove it or choose a different work directory."
+fi
+
 # Final space check
 if ! check_space 1; then
-    log_error "Insufficient space for ISO creation"
-    exit 1
+    fatal_error "Insufficient space for ISO creation"
 fi
 
 # Use xorriso with proper error handling - FIXED: Using dynamic ISOHDPFX_BIN path
@@ -637,6 +684,10 @@ if $SUDO xorriso -as mkisofs \
     -b boot/isolinux/isolinux.bin \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
     -eltorito-alt-boot \
+    -e EFI/BOOT/efiboot.img \
+    -no-emul-boot \
+    -isohybrid-gpt-basdat \
+    -append_partition 2 0xef "$CDROOT_DIR/efiboot.img" \
     -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
     -joliet-long \
     -allow-leading-dots \
@@ -646,7 +697,7 @@ if $SUDO xorriso -as mkisofs \
     -max-iso9660-filenames \
     -full-iso9660-filenames \
     .; then
-    log_info "ISO created successfully with xorriso"
+    log_info "ISO created successfully with xorriso (UEFI+BIOS)"
 else
     # Improved fallback with better error handling
     log_warning "xorriso failed, falling back to genisoimage..."
@@ -666,10 +717,9 @@ else
         -allow-limited-size \
         -udf \
         .; then
-        log_info "ISO created successfully with genisoimage"
+        log_info "ISO created successfully with genisoimage (BIOS only)"
     else
-        log_error "Both xorriso and genisoimage failed to create ISO"
-        exit 1
+        fatal_error "Both xorriso and genisoimage failed to create ISO"
     fi
 fi
 
@@ -686,12 +736,68 @@ if command -v isoinfo >/dev/null 2>&1; then
     fi
 fi
 
+# Automated QEMU Boot Test
+qemu_boot_test() {
+    local iso_path="$WORKDIR/$ISO_NAME"
+    log_info "Running automated QEMU boot test (BIOS and UEFI)..."
+    if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        log_warning "QEMU is not installed. Skipping automated boot test."
+        return 0
+    fi
+    local bios_log="$WORKDIR/qemu-bios.log"
+    local uefi_log="$WORKDIR/qemu-uefi.log"
+    # BIOS test
+    log_info "Testing BIOS boot..."
+    timeout 20s qemu-system-x86_64 -m 1024 -cdrom "$iso_path" -boot d -display none -serial stdio > "$bios_log" 2>&1 || true
+    if grep -q "AutoISO" "$bios_log"; then
+        log_info "BIOS boot test passed."
+    else
+        log_warning "BIOS boot test did not detect expected prompt. Check $bios_log for details."
+    fi
+    # UEFI test (OVMF required)
+    UEFI_FIRMWARE=""
+    for p in /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF_CODE.fd /usr/share/qemu/OVMF_CODE.fd; do
+        if [ -f "$p" ]; then UEFI_FIRMWARE="$p"; break; fi
+    done
+    if [ -n "$UEFI_FIRMWARE" ]; then
+        log_info "Testing UEFI boot..."
+        timeout 20s qemu-system-x86_64 -m 1024 -cdrom "$iso_path" -boot d -display none -serial stdio -drive if=pflash,format=raw,readonly=on,file="$UEFI_FIRMWARE" > "$uefi_log" 2>&1 || true
+        if grep -q "AutoISO" "$uefi_log"; then
+            log_info "UEFI boot test passed."
+        else
+            log_warning "UEFI boot test did not detect expected prompt. Check $uefi_log for details."
+        fi
+    else
+        log_warning "OVMF (UEFI firmware) not found. Skipping UEFI QEMU test."
+    fi
+}
+
+# Track build start time
+BUILD_START=$(date +%s)
+# After qemu_boot_test, print a detailed end report
 echo ""
 echo "=========================="
-echo "[✓] SUCCESS!"
+echo "[✓] BUILD COMPLETE!"
 echo "=========================="
 echo "ISO created at: $WORKDIR/$ISO_NAME"
 echo "Size: $(du -h "$WORKDIR/$ISO_NAME" | cut -f1)"
+echo "Kernel version: $KERNEL_VERSION"
+echo "Build time: $(( $(date +%s) - $BUILD_START )) seconds"
+echo ""
+if [ -f "$WORKDIR/qemu-bios.log" ]; then
+    if grep -q "AutoISO" "$WORKDIR/qemu-bios.log"; then
+        echo "BIOS boot test: PASSED"
+    else
+        echo "BIOS boot test: WARNING (see $WORKDIR/qemu-bios.log)"
+    fi
+fi
+if [ -f "$WORKDIR/qemu-uefi.log" ]; then
+    if grep -q "AutoISO" "$WORKDIR/qemu-uefi.log"; then
+        echo "UEFI boot test: PASSED"
+    else
+        echo "UEFI boot test: WARNING (see $WORKDIR/qemu-uefi.log)"
+    fi
+fi
 echo ""
 echo "=== DISK SPACE USAGE ==="
 echo "Work directory: $(du -sh "$WORKDIR" | cut -f1)"
@@ -699,8 +805,7 @@ FINAL_SPACE=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
 echo "Remaining space: $((FINAL_SPACE / 1024 / 1024))GB"
 echo "Storage location: $(df -h "$WORKDIR" | awk 'NR==2 {print $1}')"
 echo ""
-echo "=== USAGE INSTRUCTIONS ==="
-echo ""
+echo "=== NEXT STEPS ==="
 echo "1. Write ISO to USB drive (CAREFUL - THIS WILL ERASE THE USB!):"
 echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress oflag=sync"
 echo "   (Replace /dev/sdX with your USB device - use 'lsblk' to identify)"
@@ -718,4 +823,105 @@ echo "   - Live Mode: No changes are saved (traditional live CD)"
 echo "   - Safe Mode: Use if you have graphics issues"
 echo "   - To RAM: Loads entire system to RAM for faster operation"
 echo ""
-echo
+echo "For troubleshooting, see logs in $WORKDIR."
+echo "Thank you for using AutoISO!"
+echo "=========================="
+
+# UEFI support is not implemented in this script. For UEFI bootable ISOs, additional steps are required (see documentation or future updates).
+
+# --- UEFI Support ---
+# Ensure required packages for UEFI
+$SUDO apt-get install -y grub-efi-amd64-bin mtools || fatal_error "Failed to install grub-efi-amd64-bin and mtools."
+
+# Create EFI directory structure
+mkdir -p "$CDROOT_DIR/EFI/BOOT" || fatal_error "Failed to create EFI/BOOT directory."
+
+# Create a 20MB FAT32 EFI System Partition image
+ESP_IMG="$WORKDIR/efiboot.img"
+dd if=/dev/zero of="$ESP_IMG" bs=1M count=20 status=none || fatal_error "Failed to create ESP image."
+mkfs.vfat "$ESP_IMG" > /dev/null || fatal_error "Failed to format ESP image as FAT32."
+
+# Mount the ESP image
+ESP_MNT="$WORKDIR/esp-mount"
+mkdir -p "$ESP_MNT"
+if mountpoint -q "$ESP_MNT" 2>/dev/null; then
+    $SUDO umount "$ESP_MNT" || true
+fi
+sudo mount -o loop "$ESP_IMG" "$ESP_MNT" || fatal_error "Failed to mount ESP image."
+
+# Create EFI/BOOT directory in ESP
+mkdir -p "$ESP_MNT/EFI/BOOT" || fatal_error "Failed to create EFI/BOOT in ESP."
+
+# Create GRUB EFI bootloader
+GRUB_EFI_BIN="$ESP_MNT/EFI/BOOT/BOOTx64.EFI"
+grub-mkimage -o "$GRUB_EFI_BIN" -p /EFI/BOOT -O x86_64-efi fat iso9660 part_gpt part_msdos normal chain linux configfile search search_label search_fs_uuid search_fs_file gfxterm gfxmenu || fatal_error "Failed to create GRUB EFI image."
+
+# Create GRUB config
+cat > "$ESP_MNT/EFI/BOOT/grub.cfg" <<EOF
+set default=0
+timeout=5
+menuentry "AutoISO Persistent Mode (Recommended)" {
+    linux /live/vmlinuz boot=live components persistence persistent=cryptsetup,removable quiet splash noswap
+    initrd /live/initrd
+}
+menuentry "AutoISO Live Mode (No Persistence)" {
+    linux /live/vmlinuz boot=live components quiet splash noswap
+    initrd /live/initrd
+}
+menuentry "AutoISO Safe Mode" {
+    linux /live/vmlinuz boot=live components quiet splash noswap nomodeset
+    initrd /live/initrd
+}
+menuentry "AutoISO to RAM (Requires 4GB+ RAM)" {
+    linux /live/vmlinuz boot=live components toram quiet splash noswap
+    initrd /live/initrd
+}
+EOF
+
+# Unmount ESP image
+sudo umount "$ESP_MNT" || fatal_error "Failed to unmount ESP image."
+rmdir "$ESP_MNT"
+
+# Copy ESP image to ISO root for xorriso
+cp "$ESP_IMG" "$CDROOT_DIR/efiboot.img" || fatal_error "Failed to copy ESP image to cdroot."
+
+# Copy BOOTx64.EFI and grub.cfg to ISO for fallback UEFI boot
+cp "$WORKDIR/efiboot.img" "$CDROOT_DIR/EFI/BOOT/efiboot.img" 2>/dev/null || true
+cp "$CDROOT_DIR/EFI/BOOT/BOOTx64.EFI" "$CDROOT_DIR/EFI/BOOT/BOOTx64.EFI" 2>/dev/null || true
+cp "$CDROOT_DIR/EFI/BOOT/grub.cfg" "$CDROOT_DIR/EFI/BOOT/grub.cfg" 2>/dev/null || true
+
+# In sanity_check_iso, use $SUDO or check $EUID before using sudo
+sanity_check_iso() {
+    local iso_path="$WORKDIR/$ISO_NAME"
+    log_info "Running ISO sanity check..."
+    if ! [ -f "$iso_path" ]; then
+        fatal_error "ISO file not found: $iso_path"
+    fi
+    if ! isoinfo -d -i "$iso_path" >/dev/null 2>&1; then
+        fatal_error "ISO integrity check failed (isoinfo)"
+    fi
+    # Mount ISO and check for files
+    local mnt="$WORKDIR/iso-mnt"
+    mkdir -p "$mnt"
+    # Use $SUDO if not root
+    local SUDO_MNT="$SUDO"
+    if [ "$EUID" -eq 0 ]; then SUDO_MNT=""; fi
+    # Before mounting, check if already mounted
+    if mountpoint -q "$mnt" 2>/dev/null; then
+        $SUDO_MNT umount "$mnt" || true
+    fi
+    $SUDO_MNT mount -o loop "$iso_path" "$mnt" || fatal_error "Failed to mount ISO for sanity check"
+    local missing=0
+    for f in /boot/isolinux/isolinux.bin /EFI/BOOT/BOOTx64.EFI /EFI/BOOT/grub.cfg /live/vmlinuz /live/initrd /live/filesystem.squashfs; do
+        if ! [ -f "$mnt$f" ]; then
+            log_error "Missing critical file in ISO: $f"
+            missing=1
+        fi
+    done
+    $SUDO_MNT umount "$mnt"
+    rmdir "$mnt"
+    if [ $missing -ne 0 ]; then
+        fatal_error "Sanity check failed: One or more critical files are missing in the ISO."
+    fi
+    log_info "ISO sanity check passed."
+}
