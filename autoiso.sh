@@ -8,7 +8,7 @@ fi
 # ========================================
 #         A U T O M A T E D   I S O        
 # ========================================
-# AutoISO - Persistent Bootable Linux ISO Creator (Improved Version)
+# AutoISO - Persistent Bootable Linux ISO Creator (Fixed Version)
 #
 # USAGE:
 #   ./autoiso.sh                           # Interactive disk selection
@@ -19,11 +19,6 @@ fi
 #   - At least 15GB free space on target disk
 #   - Root/sudo privileges
 #   - Debian/Ubuntu-based system
-#
-# EXAMPLES:
-#   ./autoiso.sh /mnt/external-ssd         # Use external SSD
-#   ./autoiso.sh /home/user/iso-build      # Use home directory
-#   ./autoiso.sh /media/user/USB-DRIVE     # Use mounted USB drive
 #
 set -e
 
@@ -93,7 +88,7 @@ echo "Work Directory: $WORKDIR"
 echo "Final ISO will be: $WORKDIR/$ISO_NAME"
 echo ""
 
-# Dynamic kernel detection
+# Dynamic kernel detection - IMPROVED
 KERNEL_VERSION=$(uname -r)
 KERNEL_FILE="/boot/vmlinuz-$KERNEL_VERSION"
 INITRD_FILE="/boot/initrd.img-$KERNEL_VERSION"
@@ -106,6 +101,14 @@ if [ ! -f "$INITRD_FILE" ]; then
     INITRD_FILE="/boot/initrd.img"
 fi
 
+# Additional fallbacks for initrd
+if [ ! -f "$INITRD_FILE" ]; then
+    INITRD_FILE="/boot/initramfs-$KERNEL_VERSION.img"
+fi
+if [ ! -f "$INITRD_FILE" ]; then
+    INITRD_FILE="/boot/initramfs.img"
+fi
+
 EXCLUDE_DIRS=(
     "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*" 
     "/lost+found" "/home/*" ".cache" "/var/cache/*" "/var/log/*"
@@ -115,6 +118,7 @@ EXCLUDE_DIRS=(
     "/var/lib/lxcfs/*" "/var/lib/systemd/coredump/*"
     "/var/spool/*" "/var/backups/*" "/boot/efi/*"
     "/var/lib/flatpak/*" "/var/lib/snapd/*"
+    "${WORKDIR}/*"  # Exclude our own work directory
 )
 
 ### Functions
@@ -183,17 +187,12 @@ fi
 if [ ! -f "$INITRD_FILE" ]; then
     log_error "Initrd file not found: $INITRD_FILE"
     echo "Available initrd files:"
-    ls -la /boot/initrd* 2>/dev/null || echo "No initrd files found in /boot/"
+    ls -la /boot/initrd* /boot/initramfs* 2>/dev/null || echo "No initrd files found in /boot/"
     exit 1
 fi
 
 log_info "Using kernel: $KERNEL_FILE"
 log_info "Using initrd: $INITRD_FILE"
-
-# Check available disk space (minimum 15GB recommended for safety)
-log_info "Checking disk space requirements..."
-echo "Work directory location: $WORKDIR"
-echo "Disk info: $(df -h "$WORKDIR" 2>/dev/null | tail -1 || echo "Path not accessible")"
 
 # Create work directory if it doesn't exist
 if [ ! -d "$WORKDIR" ]; then
@@ -302,10 +301,10 @@ $SUDO mount --bind /dev/pts "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
 # Set trap for cleanup
 trap cleanup_mounts EXIT
 
-### Configure chroot environment
+### Configure chroot environment - IMPROVED
 log_info "Configuring live system..."
 
-# Simplified chroot configuration to avoid debconf issues
+# Create live-specific configuration
 $SUDO chroot "$EXTRACT_DIR" bash -c "
     export DEBIAN_FRONTEND=noninteractive
     export DEBCONF_NONINTERACTIVE_SEEN=true
@@ -315,17 +314,28 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
     # Update package lists
     apt-get update -qq || true
     
-    # Install live-boot without debconf prompts
-    apt-get install -y --no-install-recommends live-boot live-boot-initramfs-tools || true
+    # Install live-boot and essential packages
+    apt-get install -y --no-install-recommends \
+        live-boot \
+        live-boot-initramfs-tools \
+        live-config \
+        live-config-systemd || true
     
-    # Create live user without debconf
+    # Create live user if it doesn't exist
     if ! id -u user >/dev/null 2>&1; then
         useradd -m -s /bin/bash -G sudo user || true
         echo 'user:live' | chpasswd || true
-        # Set up basic user environment
         mkdir -p /home/user/{Desktop,Documents,Downloads,Pictures,Videos} || true
         chown -R user:user /home/user || true
     fi
+    
+    # Configure autologin for live user
+    mkdir -p /etc/systemd/system/getty@tty1.service.d/
+    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'EOFAUTOLOGIN'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin user --noclear %I \$TERM
+EOFAUTOLOGIN
     
     # Install useful packages for live environment
     apt-get install -y --no-install-recommends \
@@ -333,12 +343,19 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
         wireless-tools \
         wpasupplicant \
         firefox-esr \
-        file-manager-pcmanfm \
+        pcmanfm \
         nano \
-        htop || true
+        htop \
+        sudo || true
     
     # Enable NetworkManager
     systemctl enable NetworkManager || true
+    
+    # Configure sudo for live user
+    echo 'user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/user
+    
+    # Update initramfs with live-boot hooks
+    update-initramfs -u -k all || true
     
     # Clean up to save space
     apt-get autoremove -y || true
@@ -355,12 +372,6 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
     rm -f /root/.bash_history /home/*/bash_history || true
 "
 
-# Check space after chroot operations
-if ! check_space 2; then
-    log_error "Not enough space to continue after chroot configuration"
-    exit 1
-fi
-
 # Cleanup mounts
 cleanup_mounts
 trap - EXIT
@@ -371,16 +382,6 @@ log_info "Performing advanced cleanup..."
 # Remove large log files
 $SUDO find "$EXTRACT_DIR" -name "*.log" -size +10M -delete 2>/dev/null || true
 $SUDO find "$EXTRACT_DIR" -type f -path "*/var/cache/*" -delete 2>/dev/null || true
-
-# Remove files with paths longer than ISO9660 limit
-log_info "Removing files with long paths..."
-$SUDO find "$EXTRACT_DIR" -type f | while IFS= read -r file; do
-    rel_path="${file#$EXTRACT_DIR/}"
-    if [[ ${#rel_path} -gt 180 ]]; then
-        echo "Removing long path: $rel_path"
-        $SUDO rm -f "$file" 2>/dev/null || true
-    fi
-done
 
 # Remove problematic directories
 PROBLEMATIC_DIRS=(
@@ -403,21 +404,15 @@ for dir_pattern in "${PROBLEMATIC_DIRS[@]}"; do
     fi
 done
 
-# Remove user cache directories
-$SUDO find "$EXTRACT_DIR/home" -type d -name ".cache" -exec rm -rf {} + 2>/dev/null || true
-$SUDO find "$EXTRACT_DIR/home" -type d -path "*/.mozilla/firefox/*/cache2" -exec rm -rf {} + 2>/dev/null || true
-$SUDO find "$EXTRACT_DIR/home" -type d -path "*/.config/google-chrome/*/Cache" -exec rm -rf {} + 2>/dev/null || true
-
 ### Create SquashFS filesystem
 log_info "Creating SquashFS filesystem (this may take several minutes)..."
 
-# Check space before squashfs creation
 if ! check_space 4; then
     log_error "Insufficient space for SquashFS creation"
     exit 1
 fi
 
-# Enhanced SquashFS compression options to reduce size
+# Create SquashFS with proper exclusions
 $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
     -e boot \
     -no-exports \
@@ -429,36 +424,39 @@ $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
     -processors $(nproc) \
     -progress
 
-# Check final squashfs size and warn if it's very large
-SQUASHFS_SIZE=$(stat -c%s "$CDROOT_DIR/live/filesystem.squashfs" 2>/dev/null || echo "0")
-SQUASHFS_SIZE_GB=$((SQUASHFS_SIZE / 1024 / 1024 / 1024))
-
-if [ "$SQUASHFS_SIZE_GB" -gt 4 ]; then
-    log_warning "SquashFS is ${SQUASHFS_SIZE_GB}GB - using xorriso for large file support"
-fi
-
 ### Copy kernel and initrd
 log_info "Copying kernel and initrd files..."
 $SUDO cp "$KERNEL_FILE" "$CDROOT_DIR/live/vmlinuz"
 $SUDO cp "$INITRD_FILE" "$CDROOT_DIR/live/initrd"
 
-### Setup ISOLINUX bootloader
+### Setup ISOLINUX bootloader - IMPROVED
 log_info "Setting up ISOLINUX bootloader..."
 
-# Find correct isolinux paths
+# Find correct isolinux and syslinux paths
 ISOLINUX_BIN=""
 SYSLINUX_MODULES=""
+MBR_BIN=""
 
-for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux; do
+# Search for isolinux.bin
+for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux /usr/lib/syslinux/isolinux; do
     if [ -f "$path/isolinux.bin" ]; then
         ISOLINUX_BIN="$path/isolinux.bin"
         break
     fi
 done
 
-for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux; do
-    if [ -d "$path" ]; then
+# Search for syslinux modules
+for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux /usr/lib/syslinux; do
+    if [ -d "$path" ] && [ -f "$path/menu.c32" ]; then
         SYSLINUX_MODULES="$path"
+        break
+    fi
+done
+
+# Search for MBR binary
+for path in /usr/lib/syslinux/mbr /usr/lib/ISOLINUX /usr/share/syslinux; do
+    if [ -f "$path/isohdpfx.bin" ]; then
+        MBR_BIN="$path/isohdpfx.bin"
         break
     fi
 done
@@ -468,43 +466,54 @@ if [ -z "$ISOLINUX_BIN" ]; then
     exit 1
 fi
 
-$SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
-
-# Copy syslinux modules
-if [ -n "$SYSLINUX_MODULES" ]; then
-    $SUDO cp "$SYSLINUX_MODULES"/*.c32 "$CDROOT_DIR/boot/isolinux/" 2>/dev/null || true
-    $SUDO cp "$SYSLINUX_MODULES"/*.com "$CDROOT_DIR/boot/isolinux/" 2>/dev/null || true
+if [ -z "$SYSLINUX_MODULES" ]; then
+    log_error "Syslinux modules not found. Please install syslinux package."
+    exit 1
 fi
 
-### Create boot configuration
+log_info "Using isolinux: $ISOLINUX_BIN"
+log_info "Using syslinux modules: $SYSLINUX_MODULES"
+if [ -n "$MBR_BIN" ]; then
+    log_info "Using MBR: $MBR_BIN"
+fi
+
+$SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
+
+# Copy essential syslinux modules
+for module in menu.c32 chain.c32 reboot.c32 poweroff.c32 libutil.c32 libcom32.c32; do
+    if [ -f "$SYSLINUX_MODULES/$module" ]; then
+        $SUDO cp "$SYSLINUX_MODULES/$module" "$CDROOT_DIR/boot/isolinux/"
+    fi
+done
+
+### Create boot configuration - IMPROVED
 log_info "Creating boot menu configuration..."
 cat <<EOF | $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null
 UI menu.c32
 PROMPT 0
 MENU TITLE AutoISO Persistent Live System
-MENU BACKGROUND splash.png
-TIMEOUT 100
-DEFAULT persistent
-
-LABEL persistent
-  MENU LABEL ^AutoISO Persistent Mode (Recommended)
-  KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components persistence persistent=cryptsetup,removable quiet splash noswap
+TIMEOUT 300
+DEFAULT live
 
 LABEL live
-  MENU LABEL AutoISO ^Live Mode (No Persistence)
+  MENU LABEL ^AutoISO Live Mode (Default)
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components quiet splash noswap
+  APPEND initrd=/live/initrd boot=live components locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso quiet splash
+
+LABEL persistent
+  MENU LABEL AutoISO ^Persistent Mode
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components persistence locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso quiet splash
 
 LABEL live-safe
   MENU LABEL AutoISO ^Safe Mode
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components quiet splash noswap nomodeset
+  APPEND initrd=/live/initrd boot=live components locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso nomodeset noapic acpi=off
 
 LABEL live-toram
-  MENU LABEL AutoISO to ^RAM (Requires 4GB+ RAM)
+  MENU LABEL AutoISO to ^RAM
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components toram quiet splash noswap
+  APPEND initrd=/live/initrd boot=live components toram locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso quiet splash
 
 MENU SEPARATOR
 
@@ -521,54 +530,53 @@ EOF
 log_info "Creating additional configuration files..."
 $SUDO touch "$CDROOT_DIR/boot/isolinux/boot.cat"
 
-### Build final ISO
+### Build final ISO - IMPROVED
 log_info "Building final ISO image..."
 cd "$CDROOT_DIR"
 
-# Final space check
 if ! check_space 1; then
     log_error "Insufficient space for ISO creation"
     exit 1
 fi
 
-# Use xorriso instead of genisoimage for better large file support
-log_info "Using xorriso for enhanced large file support..."
-$SUDO xorriso -as mkisofs \
-    -o "$WORKDIR/$ISO_NAME" \
-    -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-    -c boot/isolinux/boot.cat \
-    -b boot/isolinux/isolinux.bin \
-    -no-emul-boot -boot-load-size 4 -boot-info-table \
-    -eltorito-alt-boot \
-    -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
-    -joliet-long \
-    -allow-leading-dots \
-    -relaxed-filenames \
-    -allow-lowercase \
-    -allow-multidot \
-    -max-iso9660-filenames \
-    -full-iso9660-filenames \
-    .
+# Build ISO with proper hybrid support
+log_info "Creating bootable ISO with hybrid support..."
 
-# If xorriso fails, fall back to genisoimage with large file support
-if [ $? -ne 0 ]; then
-    log_warning "xorriso failed, falling back to genisoimage with large file support..."
+# First try with xorriso (preferred method)
+if command -v xorriso >/dev/null 2>&1 && [ -n "$MBR_BIN" ]; then
+    log_info "Using xorriso with hybrid boot support..."
+    $SUDO xorriso -as mkisofs \
+        -r -V "AutoISO-$(date +%Y%m%d)" \
+        -o "$WORKDIR/$ISO_NAME" \
+        -J -joliet-long \
+        -isohybrid-mbr "$MBR_BIN" \
+        -partition_offset 16 \
+        -c boot/isolinux/boot.cat \
+        -b boot/isolinux/isolinux.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        .
+    
+    # Make the ISO hybrid bootable
+    if command -v isohybrid >/dev/null 2>&1; then
+        log_info "Making ISO hybrid bootable..."
+        $SUDO isohybrid "$WORKDIR/$ISO_NAME" 2>/dev/null || log_warning "isohybrid failed, but ISO should still work"
+    fi
+else
+    # Fallback to genisoimage
+    log_warning "Using genisoimage (xorriso not available or MBR not found)..."
     $SUDO genisoimage \
         -o "$WORKDIR/$ISO_NAME" \
         -b boot/isolinux/isolinux.bin \
         -c boot/isolinux/boot.cat \
         -no-emul-boot -boot-load-size 4 -boot-info-table \
-        -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
-        -allow-leading-dots \
-        -relaxed-filenames \
-        -allow-lowercase \
-        -allow-multidot \
-        -max-iso9660-filenames \
-        -joliet-long \
-        -full-iso9660-filenames \
-        -allow-limited-size \
-        -udf \
+        -J -R -V "AutoISO-$(date +%Y%m%d)" \
         .
+    
+    # Make hybrid if possible
+    if command -v isohybrid >/dev/null 2>&1; then
+        log_info "Making ISO hybrid bootable..."
+        $SUDO isohybrid "$WORKDIR/$ISO_NAME" 2>/dev/null || log_warning "isohybrid failed"
+    fi
 fi
 
 # Make ISO readable by user
@@ -577,7 +585,11 @@ $SUDO chmod 644 "$WORKDIR/$ISO_NAME"
 # Verify ISO integrity
 log_info "Verifying ISO integrity..."
 if command -v isoinfo >/dev/null 2>&1; then
-    isoinfo -d -i "$WORKDIR/$ISO_NAME" >/dev/null 2>&1 && log_info "ISO integrity check passed" || log_warning "ISO integrity check failed"
+    if isoinfo -d -i "$WORKDIR/$ISO_NAME" >/dev/null 2>&1; then
+        log_info "ISO integrity check passed"
+    else
+        log_warning "ISO integrity check failed - but ISO might still work"
+    fi
 fi
 
 echo ""
@@ -596,29 +608,28 @@ echo ""
 echo "=== USAGE INSTRUCTIONS ==="
 echo ""
 echo "1. Write ISO to USB drive (CAREFUL - THIS WILL ERASE THE USB!):"
-echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress oflag=sync"
-echo "   (Replace /dev/sdX with your USB device - use 'lsblk' to identify)"
+echo "   First, identify your USB device:"
+echo "   lsblk"
+echo "   Then write the ISO (replace sdX with your USB device):"
+echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress conv=fsync"
 echo ""
-echo "2. Create persistence partition (OPTIONAL for persistent mode):"
-echo "   a) Use gparted or fdisk to create a second partition on the USB"
-echo "   b) Format it as ext4: sudo mkfs.ext4 -L persistence /dev/sdX2"
-echo "   c) Mount it: sudo mkdir -p /mnt/persistence && sudo mount /dev/sdX2 /mnt/persistence"
-echo "   d) Create persistence.conf: echo '/ union' | sudo tee /mnt/persistence/persistence.conf"
-echo "   e) Unmount: sudo umount /mnt/persistence"
+echo "2. Alternative: Use a GUI tool like Etcher, Rufus, or Startup Disk Creator"
 echo ""
-echo "3. Boot Options:"
-echo "   - Persistent Mode: Your changes are saved between reboots"
-echo "   - Live Mode: No changes are saved (traditional live CD)"
-echo "   - Safe Mode: Use if you have graphics issues"
-echo "   - To RAM: Loads entire system to RAM for faster operation"
+echo "3. Boot from USB:"
+echo "   - Select 'AutoISO Live Mode' for normal live session"
+echo "   - Select 'AutoISO Persistent Mode' if you have a persistence partition"
+echo "   - Select 'Safe Mode' if you have boot issues"
 echo ""
-echo "Default login: user / live (user has sudo privileges)"
+echo "4. Default login: user / live (user has sudo privileges)"
+echo ""
+echo "=== TROUBLESHOOTING ==="
+echo "If the ISO doesn't boot:"
+echo "1. Verify USB write: sudo cmp '$WORKDIR/$ISO_NAME' /dev/sdX"
+echo "2. Try different USB port/drive"
+echo "3. Check BIOS/UEFI settings (disable Secure Boot, enable Legacy/CSM)"
+echo "4. Try Safe Mode boot option"
 echo ""
 echo "=== CLEANUP ==="
 echo "To free up space, run: sudo rm -rf $WORKDIR"
 echo ""
-echo "=== FUTURE RUNS ==="
-echo "To use this same location again:"
-echo "  $0 $(dirname "$WORKDIR")"
-echo "Or set: export WORKDIR=$WORKDIR"
 echo "=============================="
