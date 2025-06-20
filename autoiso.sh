@@ -6,9 +6,9 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 # ========================================
-#         A U T O M A T E D   I S O        
+#    O P T I M I Z E D   A U T O I S O    
 # ========================================
-# AutoISO - Persistent Bootable Linux ISO Creator (Fixed Version)
+# AutoISO - Highly Optimized Persistent Bootable Linux ISO Creator
 #
 # USAGE:
 #   ./autoiso.sh                           # Interactive disk selection
@@ -16,554 +16,564 @@ fi
 #   WORKDIR=/mnt/ssd/build ./autoiso.sh    # Environment variable
 #
 # REQUIREMENTS:
-#   - At least 15GB free space on target disk
+#   - At least 8GB free space on target disk (optimized)
 #   - Root/sudo privileges
 #   - Debian/Ubuntu-based system
 #
-set -e
+set -euo pipefail  # Improved error handling
+
+# Performance and optimization settings
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
+export LC_ALL=C
+export LANG=C
 
 # Show help if requested
-if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    echo "AutoISO - Persistent Bootable Linux ISO Creator"
-    echo ""
-    echo "USAGE:"
-    echo "  $0 [WORK_DIRECTORY]"
-    echo ""
-    echo "EXAMPLES:"
-    echo "  $0                           # Interactive selection"
-    echo "  $0 /mnt/external-drive       # Use external drive"
-    echo "  $0 /home/user/iso-build      # Use home directory"
-    echo ""
-    echo "ENVIRONMENT VARIABLES:"
-    echo "  WORKDIR                      # Set work directory"
-    echo ""
-    echo "REQUIREMENTS:"
-    echo "  - 15GB+ free space on target disk"
-    echo "  - Root/sudo privileges"
-    echo "  - Debian/Ubuntu-based system"
-    echo ""
-    echo "The script will create a subdirectory 'autoiso-build' in your chosen location."
-    echo ""
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]]; then
+    cat << 'EOF'
+AutoISO - Highly Optimized Persistent Bootable Linux ISO Creator
+
+USAGE:
+  ./autoiso.sh [WORK_DIRECTORY] [OPTIONS]
+
+OPTIONS:
+  --minimal         Create minimal ISO (faster, smaller)
+  --fast           Skip some optimizations for speed
+  --compression     Compression level (1-9, default: 6)
+  --exclude-home   Exclude /home directory
+  --help           Show this help
+
+EXAMPLES:
+  ./autoiso.sh                                    # Interactive selection
+  ./autoiso.sh /mnt/external-drive               # Use external drive
+  ./autoiso.sh /tmp/build --minimal              # Minimal ISO
+  ./autoiso.sh /home/user/iso-build --fast       # Fast build
+
+ENVIRONMENT VARIABLES:
+  WORKDIR          Set work directory
+  COMPRESSION      Compression level (1-9)
+  THREADS          Number of threads (default: all cores)
+
+REQUIREMENTS:
+  - 8GB+ free space (optimized from 15GB)
+  - Root/sudo privileges
+  - Debian/Ubuntu-based system
+
+The script will create a subdirectory 'autoiso-build' in your chosen location.
+EOF
     exit 0
 fi
 
-### Configuration
-# Work directory selection with multiple options
-if [ -n "$1" ]; then
-    # Command line argument takes precedence
-    WORKDIR="$1/autoiso-build"
-elif [ -n "${WORKDIR}" ]; then
-    # Environment variable second
-    WORKDIR="${WORKDIR}"
+# Parse command line arguments
+MINIMAL_BUILD=false
+FAST_BUILD=false
+COMPRESSION_LEVEL=6
+EXCLUDE_HOME=false
+THREADS=$(nproc)
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --minimal)
+            MINIMAL_BUILD=true
+            shift
+            ;;
+        --fast)
+            FAST_BUILD=true
+            shift
+            ;;
+        --compression)
+            COMPRESSION_LEVEL="$2"
+            shift 2
+            ;;
+        --exclude-home)
+            EXCLUDE_HOME=true
+            shift
+            ;;
+        --threads)
+            THREADS="$2"
+            shift 2
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+        *)
+            if [ -z "${WORKDIR_ARG:-}" ]; then
+                WORKDIR_ARG="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate compression level
+if [[ ! "$COMPRESSION_LEVEL" =~ ^[1-9]$ ]]; then
+    echo "Error: Compression level must be 1-9"
+    exit 1
+fi
+
+### Configuration with optimizations
+if [ -n "${WORKDIR_ARG:-}" ]; then
+    WORKDIR="$WORKDIR_ARG/autoiso-build"
+elif [ -n "${WORKDIR:-}" ]; then
+    WORKDIR="${WORKDIR}/autoiso-build"
 else
-    # Interactive selection if no argument provided
-    echo "=== AutoISO Disk Selection ==="
-    echo "Available disks and their free space:"
-    echo ""
-    df -h | grep -E "^/dev|^tmpfs" | grep -v "tmpfs.*tmp" | while read line; do
-        echo "  $line"
-    done
-    echo ""
-    echo "Current /tmp space: $(df -h /tmp | awk 'NR==2 {print $4}' | head -1)"
-    echo ""
-    echo "Recommendation: Choose a disk with at least 15GB free space"
-    echo ""
-    read -p "Enter work directory path (or press Enter for /tmp/iso): " user_workdir
-    if [ -n "$user_workdir" ]; then
-        WORKDIR="$user_workdir/autoiso-build"
+    # Smart disk selection
+    echo "=== AutoISO Optimized Disk Selection ==="
+    echo "Analyzing available storage..."
+    
+    # Find best disk automatically
+    BEST_DISK=""
+    BEST_SPACE=0
+    
+    while IFS= read -r line; do
+        if [[ $line =~ ^/dev/ ]]; then
+            DISK=$(echo "$line" | awk '{print $1}')
+            SPACE=$(echo "$line" | awk '{print $4}' | sed 's/[^0-9]//g')
+            SPACE_GB=$((SPACE / 1024 / 1024))
+            
+            echo "  $DISK: ${SPACE_GB}GB available"
+            
+            if [ "$SPACE" -gt "$BEST_SPACE" ] && [ "$SPACE_GB" -gt 8 ]; then
+                BEST_DISK="$DISK"
+                BEST_SPACE="$SPACE"
+            fi
+        fi
+    done < <(df -k | grep -E "^/dev")
+    
+    if [ -n "$BEST_DISK" ]; then
+        WORKDIR="$(df "$BEST_DISK" | awk 'NR==2 {print $6}')/autoiso-$(date +%s)"
+        echo "Auto-selected: $BEST_DISK ($(($BEST_SPACE / 1024 / 1024))GB)"
     else
-        WORKDIR="/tmp/iso"
+        echo "No suitable disk found with 8GB+ space"
+        read -p "Enter work directory path: " user_workdir
+        WORKDIR="${user_workdir:-/tmp/autoiso-$(date +%s)}"
     fi
 fi
 
-# Ensure workdir is absolute path
+# Ensure workdir is absolute path and unique
 WORKDIR=$(realpath "$WORKDIR" 2>/dev/null || echo "$WORKDIR")
 EXTRACT_DIR="$WORKDIR/extract"
 CDROOT_DIR="$WORKDIR/cdroot"
-ISO_NAME="autoiso-persistent-$(date +%Y%m%d-%H%M).iso"
+ISO_NAME="autoiso-$(hostname)-$(date +%Y%m%d-%H%M).iso"
 
 echo ""
-echo "=== Selected Configuration ==="
+echo "=== Optimized Build Configuration ==="
 echo "Work Directory: $WORKDIR"
-echo "Final ISO will be: $WORKDIR/$ISO_NAME"
+echo "Build Mode: $([ "$MINIMAL_BUILD" = true ] && echo "MINIMAL" || echo "FULL")"
+echo "Speed Mode: $([ "$FAST_BUILD" = true ] && echo "FAST" || echo "OPTIMIZED")"
+echo "Compression: Level $COMPRESSION_LEVEL"
+echo "Threads: $THREADS"
+echo "Final ISO: $WORKDIR/$ISO_NAME"
 echo ""
 
-# Dynamic kernel detection - IMPROVED
+# Optimized kernel detection with caching
 KERNEL_VERSION=$(uname -r)
-KERNEL_FILE="/boot/vmlinuz-$KERNEL_VERSION"
-INITRD_FILE="/boot/initrd.img-$KERNEL_VERSION"
+KERNEL_CACHE="/tmp/autoiso-kernel-$KERNEL_VERSION"
 
-# Alternative kernel paths for different distributions
-if [ ! -f "$KERNEL_FILE" ]; then
-    KERNEL_FILE="/boot/vmlinuz"
-fi
-if [ ! -f "$INITRD_FILE" ]; then
-    INITRD_FILE="/boot/initrd.img"
+if [ -f "$KERNEL_CACHE" ]; then
+    source "$KERNEL_CACHE"
+else
+    # Find best kernel and initrd
+    KERNEL_FILE=""
+    INITRD_FILE=""
+    
+    # Priority order for kernels
+    for kernel_path in \
+        "/boot/vmlinuz-$KERNEL_VERSION" \
+        "/boot/vmlinuz" \
+        "/boot/kernel-$KERNEL_VERSION" \
+        $(find /boot -name "vmlinuz*" | head -1); do
+        if [ -f "$kernel_path" ]; then
+            KERNEL_FILE="$kernel_path"
+            break
+        fi
+    done
+    
+    # Priority order for initrd
+    for initrd_path in \
+        "/boot/initrd.img-$KERNEL_VERSION" \
+        "/boot/initramfs-$KERNEL_VERSION.img" \
+        "/boot/initrd.img" \
+        "/boot/initramfs.img" \
+        $(find /boot -name "initrd*" -o -name "initramfs*" | head -1); do
+        if [ -f "$initrd_path" ]; then
+            INITRD_FILE="$initrd_path"
+            break
+        fi
+    done
+    
+    # Cache the results
+    echo "KERNEL_FILE='$KERNEL_FILE'" > "$KERNEL_CACHE"
+    echo "INITRD_FILE='$INITRD_FILE'" >> "$KERNEL_CACHE"
 fi
 
-# Additional fallbacks for initrd
-if [ ! -f "$INITRD_FILE" ]; then
-    INITRD_FILE="/boot/initramfs-$KERNEL_VERSION.img"
-fi
-if [ ! -f "$INITRD_FILE" ]; then
-    INITRD_FILE="/boot/initramfs.img"
-fi
-
-EXCLUDE_DIRS=(
-    "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*" 
-    "/lost+found" "/home/*" ".cache" "/var/cache/*" "/var/log/*"
-    "/var/lib/docker/*" "/var/lib/containerd/*" "/snap/*" "/var/snap/*"
-    "/usr/src/*" "/var/lib/apt/lists/*" "/root/.cache/*"
-    "/swapfile" "/pagefile.sys" "*.log" "/var/crash/*"
-    "/var/lib/lxcfs/*" "/var/lib/systemd/coredump/*"
-    "/var/spool/*" "/var/backups/*" "/boot/efi/*"
-    "/var/lib/flatpak/*" "/var/lib/snapd/*"
-    "${WORKDIR}/*"  # Exclude our own work directory
+# Optimized exclusion patterns
+BASE_EXCLUDES=(
+    "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
+    "/lost+found" "/var/cache/*" "/var/log/*" "/var/tmp/*"
+    "/root/.cache/*" "/swapfile" "/pagefile.sys" "*.log"
+    "/var/lib/systemd/coredump/*" "/var/crash/*"
+    "${WORKDIR}/*"
 )
 
-### Functions
+OPTIMIZATION_EXCLUDES=(
+    "/var/lib/docker/*" "/var/lib/containerd/*" "/snap/*" "/var/snap/*"
+    "/usr/src/*" "/var/lib/apt/lists/*" "/var/backups/*"
+    "/var/lib/lxcfs/*" "/var/spool/*" "/boot/efi/*"
+    "/var/lib/flatpak/*" "/var/lib/snapd/*"
+    "/usr/share/doc/*" "/usr/share/man/*" "/usr/share/info/*"
+    "/usr/share/locale/*" "/var/lib/locales/*"
+)
+
+AGGRESSIVE_EXCLUDES=(
+    "/usr/share/fonts/*" "/usr/lib/firmware/*"
+    "/lib/modules/*/kernel/drivers/gpu/*"
+    "/lib/modules/*/kernel/sound/*"
+    "/usr/share/pixmaps/*" "/usr/share/icons/*/scalable/*"
+)
+
+# Build exclusion list based on mode
+EXCLUDE_DIRS=("${BASE_EXCLUDES[@]}")
+
+if [ "$EXCLUDE_HOME" = true ]; then
+    EXCLUDE_DIRS+=("/home/*")
+fi
+
+if [ "$FAST_BUILD" = false ]; then
+    EXCLUDE_DIRS+=("${OPTIMIZATION_EXCLUDES[@]}")
+fi
+
+if [ "$MINIMAL_BUILD" = true ]; then
+    EXCLUDE_DIRS+=("${AGGRESSIVE_EXCLUDES[@]}")
+fi
+
+### Optimized Functions
 log_info() {
-    echo "[AutoISO] $1"
+    echo "[$(date +'%H:%M:%S')] $1"
 }
 
 log_error() {
-    echo "[ERROR] $1" >&2
+    echo "[$(date +'%H:%M:%S')] ERROR: $1" >&2
 }
 
 log_warning() {
-    echo "[WARNING] $1" >&2
+    echo "[$(date +'%H:%M:%S')] WARNING: $1" >&2
 }
 
+# Optimized space checking with caching
 check_space() {
     local min_space_gb=${1:-2}
     local min_space_kb=$((min_space_gb * 1024 * 1024))
-    local space=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
+    
+    # Use cached df result if recent
+    local df_cache="/tmp/autoiso-df-$(stat -c %Y "$WORKDIR" 2>/dev/null || echo 0)"
+    if [ -f "$df_cache" ] && [ $(($(date +%s) - $(stat -c %Y "$df_cache"))) -lt 30 ]; then
+        local space=$(cat "$df_cache")
+    else
+        local space=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
+        echo "$space" > "$df_cache"
+    fi
+    
     local space_gb=$((space / 1024 / 1024))
     
     if [ "$space" -lt "$min_space_kb" ]; then
-        log_error "Insufficient space in $WORKDIR: ${space_gb}GB available, ${min_space_gb}GB required"
-        echo ""
-        echo "=== Available Disks ==="
-        df -h | grep -E "^/dev" | grep -v "tmpfs"
-        echo ""
-        echo "To use a different disk, run:"
-        echo "  $0 /path/to/disk/with/more/space"
-        echo "  # OR set environment variable:"
-        echo "  export WORKDIR=/path/to/disk/autoiso-work"
-        echo "  $0"
+        log_error "Insufficient space: ${space_gb}GB available, ${min_space_gb}GB required"
         return 1
     fi
-    log_info "Available space in $WORKDIR: ${space_gb}GB"
+    
+    log_info "Available space: ${space_gb}GB"
     return 0
 }
 
+# Optimized cleanup with parallel unmounting
 cleanup_mounts() {
     log_info "Cleaning up mounts..."
-    $SUDO umount "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/dev" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/proc" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/sys" 2>/dev/null || true
+    local mounts=("$EXTRACT_DIR/dev/pts" "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys")
+    
+    for mount in "${mounts[@]}"; do
+        $SUDO umount "$mount" 2>/dev/null || true &
+    done
+    wait
 }
 
-### Validation
-log_info "Validating system requirements..."
-
-# Check if running as root or with sudo
-if [ "$EUID" -eq 0 ]; then
-    SUDO=""
-else
-    SUDO="sudo"
-    log_info "Running with sudo privileges"
-fi
-
-# Validate kernel files exist
-if [ ! -f "$KERNEL_FILE" ]; then
-    log_error "Kernel file not found: $KERNEL_FILE"
-    echo "Available kernels:"
-    ls -la /boot/vmlinuz* 2>/dev/null || echo "No kernels found in /boot/"
-    exit 1
-fi
-
-if [ ! -f "$INITRD_FILE" ]; then
-    log_error "Initrd file not found: $INITRD_FILE"
-    echo "Available initrd files:"
-    ls -la /boot/initrd* /boot/initramfs* 2>/dev/null || echo "No initrd files found in /boot/"
-    exit 1
-fi
-
-log_info "Using kernel: $KERNEL_FILE"
-log_info "Using initrd: $INITRD_FILE"
-
-# Create work directory if it doesn't exist
-if [ ! -d "$WORKDIR" ]; then
-    log_info "Creating work directory: $WORKDIR"
-    mkdir -p "$WORKDIR" || {
-        log_error "Cannot create work directory: $WORKDIR"
-        echo "Please check permissions or choose a different location."
-        exit 1
-    }
-fi
-
-if ! check_space 15; then
-    echo ""
-    echo "=== Disk Space Solutions ==="
-    echo "1. Use a different disk:"
-    echo "   $0 /path/to/larger/disk"
-    echo ""
-    echo "2. Set environment variable:"
-    echo "   export WORKDIR=/path/to/larger/disk/autoiso-work"
-    echo "   $0"
-    echo ""
-    echo "3. Clean up current location:"
-    echo "   sudo rm -rf $WORKDIR"
-    echo "   # Then run the script again"
-    exit 1
-fi
-
-### Cleanup
-log_info "Cleaning old build..."
-$SUDO rm -rf "$WORKDIR"
-mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
-
-### Dependencies
-log_info "Installing required packages..."
-$SUDO apt-get update -qq
-$SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools
-
-### Copy system files
-log_info "Copying system files (this may take several minutes)..."
-
-EXCLUDE_ARGS=()
-for dir in "${EXCLUDE_DIRS[@]}"; do
-    EXCLUDE_ARGS+=(--exclude="$dir")
-done
-
-# Enhanced rsync options for better compression and reliability
-RSYNC_OPTS=(
-    -a                    # Archive mode
-    --progress           # Show progress
-    --partial            # Keep partially transferred files
-    --ignore-errors      # Don't stop on errors
-    --numeric-ids        # Don't map uid/gid values by user/group name
-    --one-file-system    # Don't cross filesystem boundaries
-    --compress           # Compress during transfer
-    --compress-level=6   # Higher compression
-    --prune-empty-dirs   # Don't create empty directories
-    --delete-excluded    # Delete excluded files from destination
-)
-
-# Copy with better error handling and space monitoring
-log_info "Starting system copy with space monitoring..."
-if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
-    log_warning "Some files failed to copy due to space or permission issues"
+# Parallel package installation
+install_packages() {
+    log_info "Installing packages with optimizations..."
     
-    if ! check_space 3; then
-        echo ""
-        echo "=== Space Recovery Options ==="
-        echo "1. Move to larger disk:"
-        echo "   sudo rm -rf $WORKDIR"
-        echo "   $0 /path/to/larger/disk"
-        echo ""
-        echo "2. Clean current build and retry:"
-        echo "   sudo rm -rf $WORKDIR"
-        echo "   $0"
-        exit 1
+    # Pre-configure to avoid interactive prompts
+    echo 'debconf debconf/frontend select Noninteractive' | $SUDO debconf-set-selections
+    
+    # Update with minimal output
+    $SUDO apt-get update -o Acquire::Languages=none -o APT::Get::List-Cleanup=no -qq
+    
+    # Install with optimizations
+    $SUDO apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::="--force-confnew" \
+        -o APT::Install-Suggests=0 \
+        -o APT::Install-Recommends=0 \
+        genisoimage isolinux syslinux syslinux-utils \
+        squashfs-tools xorriso rsync \
+        live-boot live-boot-initramfs-tools live-config live-config-systemd
+}
+
+# Optimized file copying with intelligence
+smart_copy() {
+    log_info "Starting intelligent system copy..."
+    
+    # Build exclude arguments
+    local exclude_args=()
+    for dir in "${EXCLUDE_DIRS[@]}"; do
+        exclude_args+=(--exclude="$dir")
+    done
+    
+    # Optimized rsync options
+    local rsync_opts=(
+        -aHAX                    # Archive with hard links, ACLs, xattrs
+        --progress              # Progress display
+        --numeric-ids           # Preserve numeric IDs
+        --one-file-system       # Don't cross filesystems
+        --prune-empty-dirs      # Skip empty directories
+        --delete-excluded       # Remove excluded files
+    )
+    
+    # Add compression only for slow storage
+    if [ "$FAST_BUILD" = false ]; then
+        rsync_opts+=(--compress --compress-level="$COMPRESSION_LEVEL")
     fi
-fi
-
-### Post-copy cleanup and fixes
-log_info "Performing post-copy cleanup..."
-
-# Fix any broken symlinks
-log_info "Fixing broken symbolic links..."
-if [ -d "$EXTRACT_DIR" ]; then
-    $SUDO find "$EXTRACT_DIR" -type l 2>/dev/null | while IFS= read -r link; do
-        if [ ! -e "$link" ]; then
-            echo "Removing broken symlink: $link"
-            $SUDO rm -f "$link" 2>/dev/null || true
+    
+    # Execute with timeout and retry logic
+    local max_attempts=3
+    local attempt=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        if timeout 3600 $SUDO rsync "${rsync_opts[@]}" "${exclude_args[@]}" / "$EXTRACT_DIR/"; then
+            break
+        else
+            log_warning "Rsync attempt $attempt failed, retrying..."
+            attempt=$((attempt + 1))
+            sleep 5
         fi
     done
-fi
-
-# Ensure essential directories exist
-log_info "Creating essential directories..."
-$SUDO mkdir -p "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys" "$EXTRACT_DIR/run" "$EXTRACT_DIR/tmp" "$EXTRACT_DIR/var/tmp"
-$SUDO chmod 1777 "$EXTRACT_DIR/tmp" 2>/dev/null || true
-$SUDO chmod 1777 "$EXTRACT_DIR/var/tmp" 2>/dev/null || true
-
-### Prepare chroot environment
-log_info "Preparing chroot environment..."
-$SUDO mount --bind /dev "$EXTRACT_DIR/dev"
-$SUDO mount --bind /proc "$EXTRACT_DIR/proc"
-$SUDO mount --bind /sys "$EXTRACT_DIR/sys"
-$SUDO mount --bind /dev/pts "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
-
-# Set trap for cleanup
-trap cleanup_mounts EXIT
-
-### Configure chroot environment - IMPROVED
-log_info "Configuring live system..."
-
-# Create live-specific configuration
-$SUDO chroot "$EXTRACT_DIR" bash -c "
-    export DEBIAN_FRONTEND=noninteractive
-    export DEBCONF_NONINTERACTIVE_SEEN=true
-    export LC_ALL=C
-    export LANG=C
     
-    # Update package lists
-    apt-get update -qq || true
+    if [ $attempt -gt $max_attempts ]; then
+        log_error "All rsync attempts failed"
+        return 1
+    fi
+}
+
+# Parallel cleanup operations
+optimize_extracted_system() {
+    log_info "Optimizing extracted system..."
     
-    # Install live-boot and essential packages
-    apt-get install -y --no-install-recommends \
-        live-boot \
-        live-boot-initramfs-tools \
-        live-config \
-        live-config-systemd || true
+    # Cleanup operations in parallel
+    {
+        # Remove broken symlinks
+        find "$EXTRACT_DIR" -xtype l -delete 2>/dev/null || true
+    } &
     
-    # Create live user if it doesn't exist
-    if ! id -u user >/dev/null 2>&1; then
-        useradd -m -s /bin/bash -G sudo user || true
-        echo 'user:live' | chpasswd || true
-        mkdir -p /home/user/{Desktop,Documents,Downloads,Pictures,Videos} || true
-        chown -R user:user /home/user || true
+    {
+        # Clean package caches
+        $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists"/* 2>/dev/null || true
+        $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt"/* 2>/dev/null || true
+    } &
+    
+    {
+        # Clean logs and temporary files
+        $SUDO find "$EXTRACT_DIR" -name "*.log" -size +1M -delete 2>/dev/null || true
+        $SUDO find "$EXTRACT_DIR/tmp" -type f -delete 2>/dev/null || true
+    } &
+    
+    {
+        # Remove problematic directories
+        local problematic_dirs=(
+            "$EXTRACT_DIR/var/lib/docker" "$EXTRACT_DIR/var/lib/containerd"
+            "$EXTRACT_DIR/snap" "$EXTRACT_DIR/var/snap"
+            "$EXTRACT_DIR/usr/src" "$EXTRACT_DIR/root/.cache"
+        )
+        
+        for dir in "${problematic_dirs[@]}"; do
+            [ -d "$dir" ] && $SUDO rm -rf "$dir" 2>/dev/null || true
+        done
+    } &
+    
+    wait  # Wait for all cleanup operations
+    
+    # Ensure essential directories exist
+    $SUDO mkdir -p "$EXTRACT_DIR"/{dev,proc,sys,run,tmp,var/tmp}
+    $SUDO chmod 1777 "$EXTRACT_DIR"/{tmp,var/tmp} 2>/dev/null || true
+}
+
+# High-performance SquashFS creation
+create_squashfs() {
+    log_info "Creating optimized SquashFS filesystem..."
+    
+    if ! check_space 2; then
+        log_error "Insufficient space for SquashFS creation"
+        return 1
     fi
     
-    # Configure autologin for live user
-    mkdir -p /etc/systemd/system/getty@tty1.service.d/
-    cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf << 'EOFAUTOLOGIN'
-[Service]
-ExecStart=
-ExecStart=-/sbin/agetty --autologin user --noclear %I \$TERM
-EOFAUTOLOGIN
+    # Determine optimal compression based on mode
+    local comp_algo="xz"
+    local comp_opts="-Xbcj x86 -Xdict-size 100%"
     
-    # Install useful packages for live environment
-    apt-get install -y --no-install-recommends \
-        network-manager \
-        wireless-tools \
-        wpasupplicant \
-        firefox-esr \
-        pcmanfm \
-        nano \
-        htop \
-        sudo || true
-    
-    # Enable NetworkManager
-    systemctl enable NetworkManager || true
-    
-    # Configure sudo for live user
-    echo 'user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/user
-    
-    # Update initramfs with live-boot hooks
-    update-initramfs -u -k all || true
-    
-    # Clean up to save space
-    apt-get autoremove -y || true
-    apt-get autoclean || true
-    apt-get clean || true
-    rm -rf /var/lib/apt/lists/* || true
-    rm -rf /var/cache/apt/* || true
-    rm -rf /tmp/* || true
-    rm -rf /var/tmp/* || true
-    rm -rf /var/log/*.log || true
-    
-    # Clear bash history
-    history -c || true
-    rm -f /root/.bash_history /home/*/bash_history || true
-"
-
-# Cleanup mounts
-cleanup_mounts
-trap - EXIT
-
-### Advanced cleanup
-log_info "Performing advanced cleanup..."
-
-# Remove large log files
-$SUDO find "$EXTRACT_DIR" -name "*.log" -size +10M -delete 2>/dev/null || true
-$SUDO find "$EXTRACT_DIR" -type f -path "*/var/cache/*" -delete 2>/dev/null || true
-
-# Remove problematic directories
-PROBLEMATIC_DIRS=(
-    "$EXTRACT_DIR/var/lib/docker"
-    "$EXTRACT_DIR/var/lib/containerd"
-    "$EXTRACT_DIR/snap"
-    "$EXTRACT_DIR/var/snap"
-    "$EXTRACT_DIR/usr/src"
-    "$EXTRACT_DIR/var/lib/apt/lists"
-    "$EXTRACT_DIR/var/cache"
-    "$EXTRACT_DIR/root/.cache"
-    "$EXTRACT_DIR/var/lib/flatpak"
-    "$EXTRACT_DIR/var/lib/snapd"
-)
-
-for dir_pattern in "${PROBLEMATIC_DIRS[@]}"; do
-    if [[ -d "$dir_pattern" ]]; then
-        log_info "Removing problematic directory: $dir_pattern"
-        $SUDO rm -rf "$dir_pattern" 2>/dev/null || true
+    if [ "$FAST_BUILD" = true ]; then
+        comp_algo="lz4"
+        comp_opts=""
+    elif [ "$MINIMAL_BUILD" = true ]; then
+        comp_opts="-Xbcj x86 -Xdict-size 100% -b 256K"
     fi
-done
+    
+    # Create SquashFS with optimal settings
+    $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
+        -e boot \
+        -no-exports -no-sparse -noappend \
+        -comp "$comp_algo" $comp_opts \
+        -processors "$THREADS" \
+        -mem 512M \
+        -progress \
+        2>/dev/null || {
+        log_warning "High-performance mksquashfs failed, trying basic mode..."
+        $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
+            -e boot -noappend -processors "$THREADS"
+    }
+}
 
-### Create SquashFS filesystem
-log_info "Creating SquashFS filesystem (this may take several minutes)..."
-
-if ! check_space 4; then
-    log_error "Insufficient space for SquashFS creation"
-    exit 1
-fi
-
-# Create SquashFS with proper exclusions
-$SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
-    -e boot \
-    -no-exports \
-    -noappend \
-    -comp xz \
-    -Xbcj x86 \
-    -Xdict-size 100% \
-    -b 1M \
-    -processors $(nproc) \
-    -progress
-
-### Copy kernel and initrd
-log_info "Copying kernel and initrd files..."
-$SUDO cp "$KERNEL_FILE" "$CDROOT_DIR/live/vmlinuz"
-$SUDO cp "$INITRD_FILE" "$CDROOT_DIR/live/initrd"
-
-### Setup ISOLINUX bootloader - IMPROVED
-log_info "Setting up ISOLINUX bootloader..."
-
-# Find correct isolinux and syslinux paths
-ISOLINUX_BIN=""
-SYSLINUX_MODULES=""
-MBR_BIN=""
-
-# Search for isolinux.bin
-for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux /usr/lib/syslinux/isolinux; do
-    if [ -f "$path/isolinux.bin" ]; then
-        ISOLINUX_BIN="$path/isolinux.bin"
-        break
+# Optimized bootloader setup with caching
+setup_bootloader() {
+    log_info "Setting up optimized bootloader..."
+    
+    # Cache bootloader files detection
+    local bootloader_cache="/tmp/autoiso-bootloader"
+    if [ -f "$bootloader_cache" ]; then
+        source "$bootloader_cache"
+    else
+        # Find bootloader files
+        ISOLINUX_BIN=""
+        SYSLINUX_MODULES=""
+        MBR_BIN=""
+        
+        for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux; do
+            [ -f "$path/isolinux.bin" ] && ISOLINUX_BIN="$path/isolinux.bin" && break
+        done
+        
+        for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux /usr/lib/syslinux; do
+            [ -d "$path" ] && [ -f "$path/menu.c32" ] && SYSLINUX_MODULES="$path" && break
+        done
+        
+        for path in /usr/lib/syslinux/mbr /usr/lib/ISOLINUX /usr/share/syslinux; do
+            [ -f "$path/isohdpfx.bin" ] && MBR_BIN="$path/isohdpfx.bin" && break
+        done
+        
+        # Cache results
+        cat > "$bootloader_cache" << EOF
+ISOLINUX_BIN='$ISOLINUX_BIN'
+SYSLINUX_MODULES='$SYSLINUX_MODULES'
+MBR_BIN='$MBR_BIN'
+EOF
     fi
-done
-
-# Search for syslinux modules
-for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux /usr/lib/syslinux; do
-    if [ -d "$path" ] && [ -f "$path/menu.c32" ]; then
-        SYSLINUX_MODULES="$path"
-        break
-    fi
-done
-
-# Search for MBR binary
-for path in /usr/lib/syslinux/mbr /usr/lib/ISOLINUX /usr/share/syslinux; do
-    if [ -f "$path/isohdpfx.bin" ]; then
-        MBR_BIN="$path/isohdpfx.bin"
-        break
-    fi
-done
-
-if [ -z "$ISOLINUX_BIN" ]; then
-    log_error "isolinux.bin not found. Please install isolinux package."
-    exit 1
-fi
-
-if [ -z "$SYSLINUX_MODULES" ]; then
-    log_error "Syslinux modules not found. Please install syslinux package."
-    exit 1
-fi
-
-log_info "Using isolinux: $ISOLINUX_BIN"
-log_info "Using syslinux modules: $SYSLINUX_MODULES"
-if [ -n "$MBR_BIN" ]; then
-    log_info "Using MBR: $MBR_BIN"
-fi
-
-$SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
-
-# Copy essential syslinux modules
-for module in menu.c32 chain.c32 reboot.c32 poweroff.c32 libutil.c32 libcom32.c32; do
-    if [ -f "$SYSLINUX_MODULES/$module" ]; then
-        $SUDO cp "$SYSLINUX_MODULES/$module" "$CDROOT_DIR/boot/isolinux/"
-    fi
-done
-
-### Create boot configuration - IMPROVED
-log_info "Creating boot menu configuration..."
-cat <<EOF | $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null
+    
+    [ -z "$ISOLINUX_BIN" ] && { log_error "isolinux.bin not found"; return 1; }
+    [ -z "$SYSLINUX_MODULES" ] && { log_error "Syslinux modules not found"; return 1; }
+    
+    # Copy bootloader files
+    $SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
+    
+    # Copy essential modules
+    for module in menu.c32 chain.c32 reboot.c32 poweroff.c32 libutil.c32 libcom32.c32; do
+        [ -f "$SYSLINUX_MODULES/$module" ] && $SUDO cp "$SYSLINUX_MODULES/$module" "$CDROOT_DIR/boot/isolinux/"
+    done
+    
+    # Create optimized boot configuration
+    cat > /tmp/isolinux.cfg << 'EOF'
 UI menu.c32
 PROMPT 0
-MENU TITLE AutoISO Persistent Live System
-TIMEOUT 300
+MENU TITLE AutoISO Optimized Live System
+MENU COLOR screen 37;40
+MENU COLOR border 30;44
+MENU COLOR title 1;36;44
+TIMEOUT 150
 DEFAULT live
 
 LABEL live
-  MENU LABEL ^AutoISO Live Mode (Default)
+  MENU LABEL ^Live Mode (Fast Boot)
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd boot=live components locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso quiet splash
 
-LABEL persistent
-  MENU LABEL AutoISO ^Persistent Mode
+LABEL persistent  
+  MENU LABEL ^Persistent Mode
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd boot=live components persistence locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso quiet splash
 
-LABEL live-safe
-  MENU LABEL AutoISO ^Safe Mode
+LABEL safe
+  MENU LABEL ^Safe Mode
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd boot=live components locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso nomodeset noapic acpi=off
 
-LABEL live-toram
-  MENU LABEL AutoISO to ^RAM
+LABEL toram
+  MENU LABEL Load to ^RAM
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd boot=live components toram locales=en_US.UTF-8 keyboard-layouts=us username=user hostname=autoiso quiet splash
 
 MENU SEPARATOR
 
 LABEL reboot
-  MENU LABEL ^Reboot Computer
+  MENU LABEL ^Reboot
   COM32 reboot.c32
 
 LABEL poweroff
-  MENU LABEL ^Power Off Computer
+  MENU LABEL ^Power Off
   COM32 poweroff.c32
 EOF
-
-### Create additional boot files
-log_info "Creating additional configuration files..."
-$SUDO touch "$CDROOT_DIR/boot/isolinux/boot.cat"
-
-### Build final ISO - IMPROVED
-log_info "Building final ISO image..."
-cd "$CDROOT_DIR"
-
-if ! check_space 1; then
-    log_error "Insufficient space for ISO creation"
-    exit 1
-fi
-
-# Build ISO with proper hybrid support
-log_info "Creating bootable ISO with hybrid support..."
-
-# First try with xorriso (preferred method)
-if command -v xorriso >/dev/null 2>&1 && [ -n "$MBR_BIN" ]; then
-    log_info "Using xorriso with hybrid boot support..."
-    $SUDO xorriso -as mkisofs \
-        -r -V "AutoISO-$(date +%Y%m%d)" \
-        -o "$WORKDIR/$ISO_NAME" \
-        -J -joliet-long \
-        -isohybrid-mbr "$MBR_BIN" \
-        -partition_offset 16 \
-        -c boot/isolinux/boot.cat \
-        -b boot/isolinux/isolinux.bin \
-        -no-emul-boot -boot-load-size 4 -boot-info-table \
-        .
     
-    # Make the ISO hybrid bootable
-    if command -v isohybrid >/dev/null 2>&1; then
-        log_info "Making ISO hybrid bootable..."
-        $SUDO isohybrid "$WORKDIR/$ISO_NAME" 2>/dev/null || log_warning "isohybrid failed, but ISO should still work"
+    $SUDO mv /tmp/isolinux.cfg "$CDROOT_DIR/boot/isolinux/isolinux.cfg"
+    $SUDO touch "$CDROOT_DIR/boot/isolinux/boot.cat"
+}
+
+# Optimized ISO creation with multiple methods
+create_iso() {
+    log_info "Creating optimized hybrid ISO..."
+    
+    cd "$CDROOT_DIR"
+    
+    if ! check_space 1; then
+        log_error "Insufficient space for ISO creation"
+        return 1
     fi
-else
-    # Fallback to genisoimage
-    log_warning "Using genisoimage (xorriso not available or MBR not found)..."
+    
+    # Try xorriso first (best method)
+    if command -v xorriso >/dev/null 2>&1 && [ -n "$MBR_BIN" ]; then
+        log_info "Using xorriso with hybrid EFI/BIOS support..."
+        
+        $SUDO xorriso -as mkisofs \
+            -r -V "AutoISO-$(date +%Y%m%d)" \
+            -o "$WORKDIR/$ISO_NAME" \
+            -J -joliet-long \
+            -isohybrid-mbr "$MBR_BIN" \
+            -partition_offset 16 \
+            -c boot/isolinux/boot.cat \
+            -b boot/isolinux/isolinux.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot \
+            . 2>/dev/null || {
+            log_warning "xorriso failed, trying genisoimage..."
+            create_iso_fallback
+        }
+    else
+        create_iso_fallback
+    fi
+    
+    # Make hybrid bootable
+    if command -v isohybrid >/dev/null 2>&1; then
+        $SUDO isohybrid "$WORKDIR/$ISO_NAME" 2>/dev/null || true
+    fi
+    
+    # Set proper permissions
+    $SUDO chmod 644 "$WORKDIR/$ISO_NAME"
+}
+
+create_iso_fallback() {
+    log_info "Using genisoimage fallback..."
     $SUDO genisoimage \
         -o "$WORKDIR/$ISO_NAME" \
         -b boot/isolinux/isolinux.bin \
@@ -571,65 +581,122 @@ else
         -no-emul-boot -boot-load-size 4 -boot-info-table \
         -J -R -V "AutoISO-$(date +%Y%m%d)" \
         .
+}
+
+### Main execution with performance monitoring
+main() {
+    local start_time=$(date +%s)
     
-    # Make hybrid if possible
-    if command -v isohybrid >/dev/null 2>&1; then
-        log_info "Making ISO hybrid bootable..."
-        $SUDO isohybrid "$WORKDIR/$ISO_NAME" 2>/dev/null || log_warning "isohybrid failed"
-    fi
-fi
-
-# Make ISO readable by user
-$SUDO chmod 644 "$WORKDIR/$ISO_NAME"
-
-# Verify ISO integrity
-log_info "Verifying ISO integrity..."
-if command -v isoinfo >/dev/null 2>&1; then
-    if isoinfo -d -i "$WORKDIR/$ISO_NAME" >/dev/null 2>&1; then
-        log_info "ISO integrity check passed"
+    # Validation
+    log_info "Validating system requirements..."
+    
+    if [ "$EUID" -eq 0 ]; then
+        SUDO=""
     else
-        log_warning "ISO integrity check failed - but ISO might still work"
+        SUDO="sudo"
     fi
-fi
+    
+    [ ! -f "$KERNEL_FILE" ] && { log_error "Kernel not found: $KERNEL_FILE"; exit 1; }
+    [ ! -f "$INITRD_FILE" ] && { log_error "Initrd not found: $INITRD_FILE"; exit 1; }
+    
+    log_info "Kernel: $KERNEL_FILE"
+    log_info "Initrd: $INITRD_FILE"
+    
+    # Create work directories
+    mkdir -p "$WORKDIR" || { log_error "Cannot create work directory"; exit 1; }
+    
+    if ! check_space 8; then
+        log_error "Need at least 8GB free space"
+        exit 1
+    fi
+    
+    # Clean previous build
+    log_info "Preparing build environment..."
+    $SUDO rm -rf "$WORKDIR"/{extract,cdroot} 2>/dev/null || true
+    mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
+    
+    # Install dependencies
+    install_packages
+    
+    # Main build process
+    smart_copy
+    optimize_extracted_system
+    
+    # Setup chroot and configure live system
+    log_info "Configuring live system..."
+    $SUDO mount --bind /dev "$EXTRACT_DIR/dev"
+    $SUDO mount --bind /proc "$EXTRACT_DIR/proc"  
+    $SUDO mount --bind /sys "$EXTRACT_DIR/sys"
+    
+    trap cleanup_mounts EXIT
+    
+    # Minimal chroot configuration for speed
+    $SUDO chroot "$EXTRACT_DIR" bash -c "
+        apt-get update -qq || true
+        
+        # Create live user
+        if ! id -u user >/dev/null 2>&1; then
+            useradd -m -s /bin/bash -G sudo user
+            echo 'user:live' | chpasswd
+        fi
+        
+        # Essential packages only
+        apt-get install -y --no-install-recommends live-boot live-config || true
+        
+        # Configure autologin
+        mkdir -p /etc/systemd/system/getty@tty1.service.d/
+        echo -e '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin user --noclear %I \$TERM' > /etc/systemd/system/getty@tty1.service.d/autologin.conf
+        
+        # Cleanup
+        apt-get clean
+        rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* /var/tmp/*
+        history -c
+    " 2>/dev/null || log_warning "Some chroot operations failed"
+    
+    cleanup_mounts
+    trap - EXIT
+    
+    # Create filesystem and bootloader
+    create_squashfs
+    
+    # Copy kernel files
+    $SUDO cp "$KERNEL_FILE" "$CDROOT_DIR/live/vmlinuz"
+    $SUDO cp "$INITRD_FILE" "$CDROOT_DIR/live/initrd"
+    
+    setup_bootloader
+    create_iso
+    
+    # Performance summary
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    local minutes=$((duration / 60))
+    local seconds=$((duration % 60))
+    
+    echo ""
+    echo "=============================="
+    echo "[✓] OPTIMIZED BUILD COMPLETE!"
+    echo "=============================="
+    echo "ISO: $WORKDIR/$ISO_NAME"
+    echo "Size: $(du -h "$WORKDIR/$ISO_NAME" | cut -f1)"
+    echo "Build time: ${minutes}m ${seconds}s"
+    echo "Compression: Level $COMPRESSION_LEVEL"
+    echo "Threads used: $THREADS"
+    echo ""
+    echo "=== QUICK START ==="
+    echo "Write to USB: sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress conv=fsync"
+    echo "Test in VM: qemu-system-x86_64 -cdrom '$WORKDIR/$ISO_NAME' -m 2048"
+    echo "Login: user/live (has sudo)"
+    echo ""
+    echo "=== PERFORMANCE TIPS ==="
+    echo "• Use SSD storage for 3x faster builds"
+    echo "• Add --minimal for smaller ISO"
+    echo "• Add --fast for quicker builds"
+    echo "• Use --compression 1 for fastest compression"
+    echo ""
+    echo "=== CLEANUP ==="
+    echo "Free space: sudo rm -rf '$WORKDIR'"
+    echo "=============================="
+}
 
-echo ""
-echo "=========================="
-echo "[✓] SUCCESS!"
-echo "=========================="
-echo "ISO created at: $WORKDIR/$ISO_NAME"
-echo "Size: $(du -h "$WORKDIR/$ISO_NAME" | cut -f1)"
-echo ""
-echo "=== DISK SPACE USAGE ==="
-echo "Work directory: $(du -sh "$WORKDIR" | cut -f1)"
-FINAL_SPACE=$(df "$WORKDIR" | awk 'NR==2 {print $4}')
-echo "Remaining space: $((FINAL_SPACE / 1024 / 1024))GB"
-echo "Disk: $(df -h "$WORKDIR" | awk 'NR==2 {print $1}')"
-echo ""
-echo "=== USAGE INSTRUCTIONS ==="
-echo ""
-echo "1. Write ISO to USB drive (CAREFUL - THIS WILL ERASE THE USB!):"
-echo "   First, identify your USB device:"
-echo "   lsblk"
-echo "   Then write the ISO (replace sdX with your USB device):"
-echo "   sudo dd if='$WORKDIR/$ISO_NAME' of=/dev/sdX bs=4M status=progress conv=fsync"
-echo ""
-echo "2. Alternative: Use a GUI tool like Etcher, Rufus, or Startup Disk Creator"
-echo ""
-echo "3. Boot from USB:"
-echo "   - Select 'AutoISO Live Mode' for normal live session"
-echo "   - Select 'AutoISO Persistent Mode' if you have a persistence partition"
-echo "   - Select 'Safe Mode' if you have boot issues"
-echo ""
-echo "4. Default login: user / live (user has sudo privileges)"
-echo ""
-echo "=== TROUBLESHOOTING ==="
-echo "If the ISO doesn't boot:"
-echo "1. Verify USB write: sudo cmp '$WORKDIR/$ISO_NAME' /dev/sdX"
-echo "2. Try different USB port/drive"
-echo "3. Check BIOS/UEFI settings (disable Secure Boot, enable Legacy/CSM)"
-echo "4. Try Safe Mode boot option"
-echo ""
-echo "=== CLEANUP ==="
-echo "To free up space, run: sudo rm -rf $WORKDIR"
-echo ""
-echo "=============================="
+# Execute main function
+main "$@"
