@@ -1,4 +1,4 @@
-#!/bin/bash
+!/bin/bash
 # Ensure we're using bash
 if [ -z "$BASH_VERSION" ]; then
     fatal_error "This script requires bash. Please run with: bash $0"
@@ -27,6 +27,18 @@ fi
 set -e
 set -o pipefail
 
+# Move cleanup_mounts above fatal_error and trap
+cleanup_mounts() {
+    log_info "Cleaning up mounts..."
+    for mount_point in "$EXTRACT_DIR/dev/pts" "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys"; do
+        if [ -d "$mount_point" ]; then
+            if mountpoint -q "$mount_point" 2>/dev/null; then
+                $SUDO umount "$mount_point" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
 # Centralized fatal error handler
 fatal_error() {
     local msg="$1"
@@ -38,6 +50,7 @@ fatal_error() {
 
 # Trap for uncaught errors
 trap 'fatal_error "An unexpected error occurred."' ERR
+trap cleanup_mounts EXIT INT TERM
 
 # Show help if requested
 if [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
@@ -78,28 +91,20 @@ else
     echo ""
     echo "Available storage devices and partitions:"
     echo ""
-    
     # Show block devices with lsblk
     lsblk -f -o NAME,SIZE,AVAIL,USE%,FSTYPE,MOUNTPOINT | grep -E "(NAME|part|disk)" || {
         echo "Error: lsblk command failed. Falling back to df output."
         df -h | grep -E "^/dev" | grep -v "tmpfs"
     }
-    
     echo ""
     echo "Mounted filesystems with available space:"
     df -h | grep -E "^/dev|^tmpfs" | grep -v "tmpfs.*tmp" | while read line; do
         echo "  $line"
     done
-    
     echo ""
     echo "Current /tmp space: $(df -h /tmp | awk 'NR==2 {print $4}' | head -1)"
     echo ""
     echo "Recommendation: Choose a location with at least 15GB free space"
-    echo "Common choices:"
-    echo "  /tmp/iso                     # Temporary (lost on reboot)"
-    echo "  /home/$USER/iso-build        # Home directory"
-    echo "  /mnt/external-drive          # External drive"
-    echo "  /media/$USER/USB-DRIVE       # USB drive"
     echo ""
     read -t 30 -p "Enter work directory path (or press Enter for /tmp/iso): " user_workdir || user_workdir=""
     if [ -n "$user_workdir" ]; then
@@ -159,7 +164,7 @@ log_warning() {
 }
 
 # Early check for required commands
-REQUIRED_CMDS=(rsync xorriso genisoimage mksquashfs isoinfo realpath lsblk df awk grep tee stat find cp mkdir rm chmod mount umount sudo apt-get grub-efi-amd64-bin mtools)
+REQUIRED_CMDS=(rsync xorriso genisoimage mksquashfs isoinfo realpath lsblk df awk grep tee stat find cp mkdir rm chmod mount umount sudo apt-get grub-mkimage grub-install mtools)
 MISSING_CMDS=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -212,17 +217,6 @@ check_space() {
     fi
     log_info "Available space in $check_dir: ${space_gb}GB, free inodes: $inodes"
     return 0
-}
-
-cleanup_mounts() {
-    log_info "Cleaning up mounts..."
-    for mount_point in "$EXTRACT_DIR/dev/pts" "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys"; do
-        if [ -d "$mount_point" ]; then
-            if mountpoint -q "$mount_point" 2>/dev/null; then
-                $SUDO umount "$mount_point" 2>/dev/null || true
-            fi
-        fi
-    done
 }
 
 detect_distribution() {
@@ -325,7 +319,7 @@ mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
 ### Dependencies
 log_info "Installing required packages..."
 $SUDO apt-get update -qq
-$SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools grub-efi-amd64-bin mtools
+$SUDO apt-get install -y genisoimage isolinux syslinux syslinux-utils squashfs-tools xorriso rsync live-boot live-boot-initramfs-tools grub-mkimage grub-install mtools
 
 ### Copy system files
 log_info "Copying system files (this may take several minutes)..."
@@ -394,9 +388,6 @@ $SUDO mount --bind /dev "$EXTRACT_DIR/dev"
 $SUDO mount --bind /proc "$EXTRACT_DIR/proc"
 $SUDO mount --bind /sys "$EXTRACT_DIR/sys"
 $SUDO mount --bind /dev/pts "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
-
-# Trap for cleanup on EXIT, INT, TERM (set early)
-trap cleanup_mounts EXIT INT TERM
 
 ### Configure chroot environment
 log_info "Configuring live system..."
@@ -480,10 +471,6 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
 if ! check_space 2; then
     fatal_error "Not enough space to continue after chroot configuration"
 fi
-
-# Cleanup mounts
-cleanup_mounts
-trap - EXIT
 
 ### Advanced cleanup
 log_info "Performing advanced cleanup..."
@@ -831,7 +818,7 @@ echo "=========================="
 
 # --- UEFI Support ---
 # Ensure required packages for UEFI
-$SUDO apt-get install -y grub-efi-amd64-bin mtools || fatal_error "Failed to install grub-efi-amd64-bin and mtools."
+$SUDO apt-get install -y grub-mkimage grub-install mtools || fatal_error "Failed to install grub-mkimage and mtools."
 
 # Create EFI directory structure
 mkdir -p "$CDROOT_DIR/EFI/BOOT" || fatal_error "Failed to create EFI/BOOT directory."
@@ -925,3 +912,5 @@ sanity_check_iso() {
     fi
     log_info "ISO sanity check passed."
 }
+
+
