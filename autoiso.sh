@@ -417,15 +417,25 @@ if ! check_space 4; then
     exit 1
 fi
 
+# Enhanced SquashFS compression options to reduce size
 $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
     -e boot \
     -no-exports \
     -noappend \
     -comp xz \
     -Xbcj x86 \
+    -Xdict-size 100% \
     -b 1M \
     -processors $(nproc) \
     -progress
+
+# Check final squashfs size and warn if it's very large
+SQUASHFS_SIZE=$(stat -c%s "$CDROOT_DIR/live/filesystem.squashfs" 2>/dev/null || echo "0")
+SQUASHFS_SIZE_GB=$((SQUASHFS_SIZE / 1024 / 1024 / 1024))
+
+if [ "$SQUASHFS_SIZE_GB" -gt 4 ]; then
+    log_warning "SquashFS is ${SQUASHFS_SIZE_GB}GB - using xorriso for large file support"
+fi
 
 ### Copy kernel and initrd
 log_info "Copying kernel and initrd files..."
@@ -521,21 +531,45 @@ if ! check_space 1; then
     exit 1
 fi
 
-# Create ISO with enhanced options
-$SUDO genisoimage \
+# Use xorriso instead of genisoimage for better large file support
+log_info "Using xorriso for enhanced large file support..."
+$SUDO xorriso -as mkisofs \
     -o "$WORKDIR/$ISO_NAME" \
-    -b boot/isolinux/isolinux.bin \
+    -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
     -c boot/isolinux/boot.cat \
+    -b boot/isolinux/isolinux.bin \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
+    -eltorito-alt-boot \
     -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
+    -joliet-long \
     -allow-leading-dots \
     -relaxed-filenames \
     -allow-lowercase \
     -allow-multidot \
     -max-iso9660-filenames \
-    -joliet-long \
     -full-iso9660-filenames \
     .
+
+# If xorriso fails, fall back to genisoimage with large file support
+if [ $? -ne 0 ]; then
+    log_warning "xorriso failed, falling back to genisoimage with large file support..."
+    $SUDO genisoimage \
+        -o "$WORKDIR/$ISO_NAME" \
+        -b boot/isolinux/isolinux.bin \
+        -c boot/isolinux/boot.cat \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
+        -allow-leading-dots \
+        -relaxed-filenames \
+        -allow-lowercase \
+        -allow-multidot \
+        -max-iso9660-filenames \
+        -joliet-long \
+        -full-iso9660-filenames \
+        -allow-limited-size \
+        -udf \
+        .
+fi
 
 # Make ISO readable by user
 $SUDO chmod 644 "$WORKDIR/$ISO_NAME"
