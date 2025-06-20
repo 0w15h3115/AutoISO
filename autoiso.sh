@@ -8,7 +8,7 @@ fi
 # ========================================
 #         A U T O M A T E D   I S O        
 # ========================================
-# AutoISO - Persistent Bootable Linux ISO Creator (Improved Version)
+# AutoISO - Persistent Bootable Linux ISO Creator (Fixed Version)
 #
 # USAGE:
 #   ./autoiso.sh                           # Interactive disk selection
@@ -149,11 +149,18 @@ log_warning() {
 check_space() {
     local min_space_gb=${1:-2}
     local min_space_kb=$((min_space_gb * 1024 * 1024))
-    local space=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
+    
+    # Handle case where WORKDIR doesn't exist yet
+    local check_dir="$WORKDIR"
+    if [ ! -d "$WORKDIR" ]; then
+        check_dir=$(dirname "$WORKDIR")
+    fi
+    
+    local space=$(df "$check_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
     local space_gb=$((space / 1024 / 1024))
     
     if [ "$space" -lt "$min_space_kb" ]; then
-        log_error "Insufficient space in $WORKDIR: ${space_gb}GB available, ${min_space_gb}GB required"
+        log_error "Insufficient space in $check_dir: ${space_gb}GB available, ${min_space_gb}GB required"
         echo ""
         echo "=== Available Storage ==="
         lsblk -f -o NAME,SIZE,AVAIL,USE%,FSTYPE,MOUNTPOINT 2>/dev/null || df -h | grep -E "^/dev"
@@ -165,20 +172,43 @@ check_space() {
         echo "  $0"
         return 1
     fi
-    log_info "Available space in $WORKDIR: ${space_gb}GB"
+    log_info "Available space in $check_dir: ${space_gb}GB"
     return 0
 }
 
 cleanup_mounts() {
     log_info "Cleaning up mounts..."
-    $SUDO umount "$EXTRACT_DIR/dev/pts" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/dev" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/proc" 2>/dev/null || true
-    $SUDO umount "$EXTRACT_DIR/sys" 2>/dev/null || true
+    for mount_point in "$EXTRACT_DIR/dev/pts" "$EXTRACT_DIR/dev" "$EXTRACT_DIR/proc" "$EXTRACT_DIR/sys"; do
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            $SUDO umount "$mount_point" 2>/dev/null || true
+        fi
+    done
+}
+
+detect_distribution() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    else
+        echo "unknown"
+    fi
 }
 
 ### Validation
 log_info "Validating system requirements..."
+
+# Check distribution
+DISTRO=$(detect_distribution)
+if [[ ! "$DISTRO" =~ ^(debian|ubuntu|mint|pop|elementary|zorin)$ ]]; then
+    log_warning "Detected distribution: $DISTRO"
+    log_warning "This script is designed for Debian/Ubuntu-based systems"
+    read -p "Continue anyway? (y/N): " continue_anyway
+    if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
 
 # Check if running as root or with sudo
 if [ "$EUID" -eq 0 ]; then
@@ -187,6 +217,14 @@ else
     SUDO="sudo"
     log_info "Running with sudo privileges"
 fi
+
+# Validate essential system directories exist
+for essential_dir in /boot /etc /usr /var; do
+    if [ ! -d "$essential_dir" ]; then
+        log_error "Essential directory $essential_dir not found. Cannot proceed."
+        exit 1
+    fi
+done
 
 # Validate kernel files exist
 if [ ! -f "$KERNEL_FILE" ]; then
@@ -209,7 +247,6 @@ log_info "Using initrd: $INITRD_FILE"
 # Check available disk space (minimum 15GB recommended for safety)
 log_info "Checking disk space requirements..."
 echo "Work directory location: $WORKDIR"
-echo "Disk info: $(df -h "$WORKDIR" 2>/dev/null | tail -1 || echo "Path not accessible")"
 
 # Create work directory if it doesn't exist
 if [ ! -d "$WORKDIR" ]; then
@@ -220,6 +257,8 @@ if [ ! -d "$WORKDIR" ]; then
         exit 1
     }
 fi
+
+echo "Disk info: $(df -h "$WORKDIR" 2>/dev/null | tail -1 || echo "Path not accessible")"
 
 if ! check_space 15; then
     echo ""
@@ -291,12 +330,12 @@ fi
 ### Post-copy cleanup and fixes
 log_info "Performing post-copy cleanup..."
 
-# Fix any broken symlinks
+# Fix any broken symlinks (improved error handling)
 log_info "Fixing broken symbolic links..."
 if [ -d "$EXTRACT_DIR" ]; then
-    $SUDO find "$EXTRACT_DIR" -type l 2>/dev/null | while IFS= read -r link; do
+    $SUDO find "$EXTRACT_DIR" -type l -print0 2>/dev/null | while IFS= read -r -d '' link; do
         if [ ! -e "$link" ]; then
-            echo "Removing broken symlink: $link"
+            echo "Removing broken symlink: ${link#$EXTRACT_DIR/}"
             $SUDO rm -f "$link" 2>/dev/null || true
         fi
     done
@@ -321,6 +360,27 @@ trap cleanup_mounts EXIT
 ### Configure chroot environment
 log_info "Configuring live system..."
 
+# Determine packages based on distribution
+LIVE_PACKAGES="live-boot live-boot-initramfs-tools"
+NETWORK_PACKAGES="network-manager wireless-tools wpasupplicant"
+BROWSER_PACKAGE=""
+FILE_MANAGER=""
+
+case "$DISTRO" in
+    ubuntu|mint|pop|elementary|zorin)
+        BROWSER_PACKAGE="firefox"
+        FILE_MANAGER="nautilus"
+        ;;
+    debian)
+        BROWSER_PACKAGE="firefox-esr"
+        FILE_MANAGER="pcmanfm"
+        ;;
+    *)
+        BROWSER_PACKAGE="firefox-esr"
+        FILE_MANAGER="pcmanfm"
+        ;;
+esac
+
 # Simplified chroot configuration to avoid debconf issues
 $SUDO chroot "$EXTRACT_DIR" bash -c "
     export DEBIAN_FRONTEND=noninteractive
@@ -329,46 +389,46 @@ $SUDO chroot "$EXTRACT_DIR" bash -c "
     export LANG=C
     
     # Update package lists
-    apt-get update -qq || true
+    apt-get update -qq 2>/dev/null || true
     
     # Install live-boot without debconf prompts
-    apt-get install -y --no-install-recommends live-boot live-boot-initramfs-tools || true
+    apt-get install -y --no-install-recommends $LIVE_PACKAGES 2>/dev/null || true
     
     # Create live user without debconf
     if ! id -u user >/dev/null 2>&1; then
-        useradd -m -s /bin/bash -G sudo user || true
-        echo 'user:live' | chpasswd || true
+        useradd -m -s /bin/bash -G sudo user 2>/dev/null || true
+        echo 'user:live' | chpasswd 2>/dev/null || true
         # Set up basic user environment
-        mkdir -p /home/user/{Desktop,Documents,Downloads,Pictures,Videos} || true
-        chown -R user:user /home/user || true
+        mkdir -p /home/user/{Desktop,Documents,Downloads,Pictures,Videos} 2>/dev/null || true
+        chown -R user:user /home/user 2>/dev/null || true
     fi
     
-    # Install useful packages for live environment
+    # Install useful packages for live environment (with error handling)
     apt-get install -y --no-install-recommends \
-        network-manager \
-        wireless-tools \
-        wpasupplicant \
-        firefox-esr \
-        file-manager-pcmanfm \
+        $NETWORK_PACKAGES \
         nano \
-        htop || true
+        htop 2>/dev/null || true
+    
+    # Try to install browser and file manager (non-critical)
+    apt-get install -y --no-install-recommends $BROWSER_PACKAGE 2>/dev/null || true
+    apt-get install -y --no-install-recommends $FILE_MANAGER 2>/dev/null || true
     
     # Enable NetworkManager
-    systemctl enable NetworkManager || true
+    systemctl enable NetworkManager 2>/dev/null || true
     
     # Clean up to save space
-    apt-get autoremove -y || true
-    apt-get autoclean || true
-    apt-get clean || true
-    rm -rf /var/lib/apt/lists/* || true
-    rm -rf /var/cache/apt/* || true
-    rm -rf /tmp/* || true
-    rm -rf /var/tmp/* || true
-    rm -rf /var/log/*.log || true
+    apt-get autoremove -y 2>/dev/null || true
+    apt-get autoclean 2>/dev/null || true
+    apt-get clean 2>/dev/null || true
+    rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+    rm -rf /var/cache/apt/* 2>/dev/null || true
+    rm -rf /tmp/* 2>/dev/null || true
+    rm -rf /var/tmp/* 2>/dev/null || true
+    rm -rf /var/log/*.log 2>/dev/null || true
     
     # Clear bash history
-    history -c || true
-    rm -f /root/.bash_history /home/*/bash_history || true
+    history -c 2>/dev/null || true
+    rm -f /root/.bash_history /home/*/bash_history 2>/dev/null || true
 "
 
 # Check space after chroot operations
@@ -388,12 +448,12 @@ log_info "Performing advanced cleanup..."
 $SUDO find "$EXTRACT_DIR" -name "*.log" -size +10M -delete 2>/dev/null || true
 $SUDO find "$EXTRACT_DIR" -type f -path "*/var/cache/*" -delete 2>/dev/null || true
 
-# Remove files with paths longer than ISO9660 limit
-log_info "Removing files with long paths..."
-$SUDO find "$EXTRACT_DIR" -type f | while IFS= read -r file; do
+# Remove files with paths longer than ISO9660 limit (more conservative)
+log_info "Removing files with excessively long paths..."
+$SUDO find "$EXTRACT_DIR" -type f -print0 2>/dev/null | while IFS= read -r -d '' file; do
     rel_path="${file#$EXTRACT_DIR/}"
-    if [[ ${#rel_path} -gt 180 ]]; then
-        echo "Removing long path: $rel_path"
+    if [[ ${#rel_path} -gt 200 ]]; then
+        echo "Removing long path: ${rel_path:0:50}..."
         $SUDO rm -f "$file" 2>/dev/null || true
     fi
 done
@@ -414,7 +474,7 @@ PROBLEMATIC_DIRS=(
 
 for dir_pattern in "${PROBLEMATIC_DIRS[@]}"; do
     if [[ -d "$dir_pattern" ]]; then
-        log_info "Removing problematic directory: $dir_pattern"
+        log_info "Removing problematic directory: ${dir_pattern#$EXTRACT_DIR/}"
         $SUDO rm -rf "$dir_pattern" 2>/dev/null || true
     fi
 done
@@ -461,10 +521,12 @@ $SUDO cp "$INITRD_FILE" "$CDROOT_DIR/live/initrd"
 ### Setup ISOLINUX bootloader
 log_info "Setting up ISOLINUX bootloader..."
 
-# Find correct isolinux paths
+# Find correct isolinux paths - FIXED: Added dynamic detection for both files
 ISOLINUX_BIN=""
+ISOHDPFX_BIN=""
 SYSLINUX_MODULES=""
 
+# Find isolinux.bin
 for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux; do
     if [ -f "$path/isolinux.bin" ]; then
         ISOLINUX_BIN="$path/isolinux.bin"
@@ -472,6 +534,15 @@ for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux; do
     fi
 done
 
+# Find isohdpfx.bin - CRITICAL FIX
+for path in /usr/lib/isolinux /usr/lib/ISOLINUX /usr/share/isolinux /usr/lib/syslinux/mbr; do
+    if [ -f "$path/isohdpfx.bin" ]; then
+        ISOHDPFX_BIN="$path/isohdpfx.bin"
+        break
+    fi
+done
+
+# Find syslinux modules
 for path in /usr/lib/syslinux/modules/bios /usr/share/syslinux; do
     if [ -d "$path" ]; then
         SYSLINUX_MODULES="$path"
@@ -481,8 +552,18 @@ done
 
 if [ -z "$ISOLINUX_BIN" ]; then
     log_error "isolinux.bin not found. Please install isolinux package."
+    echo "Searched in: /usr/lib/isolinux, /usr/lib/ISOLINUX, /usr/share/isolinux"
     exit 1
 fi
+
+if [ -z "$ISOHDPFX_BIN" ]; then
+    log_error "isohdpfx.bin not found. Please install isolinux package."
+    echo "Searched in: /usr/lib/isolinux, /usr/lib/ISOLINUX, /usr/share/isolinux, /usr/lib/syslinux/mbr"
+    exit 1
+fi
+
+log_info "Found isolinux.bin: $ISOLINUX_BIN"
+log_info "Found isohdpfx.bin: $ISOHDPFX_BIN"
 
 $SUDO cp "$ISOLINUX_BIN" "$CDROOT_DIR/boot/isolinux/"
 
@@ -547,11 +628,11 @@ if ! check_space 1; then
     exit 1
 fi
 
-# Use xorriso instead of genisoimage for better large file support
+# Use xorriso with proper error handling - FIXED: Using dynamic ISOHDPFX_BIN path
 log_info "Using xorriso for enhanced large file support..."
-$SUDO xorriso -as mkisofs \
+if $SUDO xorriso -as mkisofs \
     -o "$WORKDIR/$ISO_NAME" \
-    -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+    -isohybrid-mbr "$ISOHDPFX_BIN" \
     -c boot/isolinux/boot.cat \
     -b boot/isolinux/isolinux.bin \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
@@ -564,12 +645,12 @@ $SUDO xorriso -as mkisofs \
     -allow-multidot \
     -max-iso9660-filenames \
     -full-iso9660-filenames \
-    .
-
-# If xorriso fails, fall back to genisoimage with large file support
-if [ $? -ne 0 ]; then
-    log_warning "xorriso failed, falling back to genisoimage with large file support..."
-    $SUDO genisoimage \
+    .; then
+    log_info "ISO created successfully with xorriso"
+else
+    # Improved fallback with better error handling
+    log_warning "xorriso failed, falling back to genisoimage..."
+    if $SUDO genisoimage \
         -o "$WORKDIR/$ISO_NAME" \
         -b boot/isolinux/isolinux.bin \
         -c boot/isolinux/boot.cat \
@@ -584,7 +665,12 @@ if [ $? -ne 0 ]; then
         -full-iso9660-filenames \
         -allow-limited-size \
         -udf \
-        .
+        .; then
+        log_info "ISO created successfully with genisoimage"
+    else
+        log_error "Both xorriso and genisoimage failed to create ISO"
+        exit 1
+    fi
 fi
 
 # Make ISO readable by user
@@ -593,7 +679,11 @@ $SUDO chmod 644 "$WORKDIR/$ISO_NAME"
 # Verify ISO integrity
 log_info "Verifying ISO integrity..."
 if command -v isoinfo >/dev/null 2>&1; then
-    isoinfo -d -i "$WORKDIR/$ISO_NAME" >/dev/null 2>&1 && log_info "ISO integrity check passed" || log_warning "ISO integrity check failed"
+    if isoinfo -d -i "$WORKDIR/$ISO_NAME" >/dev/null 2>&1; then
+        log_info "ISO integrity check passed"
+    else
+        log_warning "ISO integrity check failed - ISO may still be usable"
+    fi
 fi
 
 echo ""
@@ -628,13 +718,4 @@ echo "   - Live Mode: No changes are saved (traditional live CD)"
 echo "   - Safe Mode: Use if you have graphics issues"
 echo "   - To RAM: Loads entire system to RAM for faster operation"
 echo ""
-echo "Default login: user / live (user has sudo privileges)"
-echo ""
-echo "=== CLEANUP ==="
-echo "To free up space, run: sudo rm -rf $WORKDIR"
-echo ""
-echo "=== FUTURE RUNS ==="
-echo "To use this same location again:"
-echo "  $0 $(dirname "$WORKDIR")"
-echo "Or set: export WORKDIR=$WORKDIR"
-echo "=============================="
+echo
