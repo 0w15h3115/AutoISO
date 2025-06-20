@@ -1,4 +1,4 @@
-!/bin/bash
+#!/bin/bash
 # Ensure we're using bash
 if [ -z "$BASH_VERSION" ]; then
     fatal_error "This script requires bash. Please run with: bash $0"
