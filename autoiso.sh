@@ -293,7 +293,25 @@ RSYNC_OPTS=(
 
 # Copy with better error handling and space monitoring
 log_info "Starting system copy with space monitoring..."
-if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
+# Use rsync with progress bar instead of verbose output
+if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/" 2>&1 | while IFS= read -r line; do
+    # Filter out verbose progress lines and show a simple progress indicator
+    if [[ "$line" =~ to-chk ]]; then
+        # Extract percentage if available, otherwise show a simple dot
+        if [[ "$line" =~ ([0-9]+%) ]]; then
+            echo -ne "\r[AutoISO] Copying system files... ${BASH_REMATCH[1]}"
+        else
+            echo -n "."
+        fi
+    elif [[ "$line" =~ ^[0-9]+% ]]; then
+        # Show percentage lines
+        echo -ne "\r[AutoISO] Copying system files... $line"
+    elif [[ "$line" =~ ^rsync: ]]; then
+        # Show rsync errors/warnings
+        echo -e "\n[WARNING] $line"
+    fi
+done; then
+    echo -e "\n[AutoISO] System copy completed"
     log_warning "Some files failed to copy due to space or permission issues"
     
     if ! check_space 3; then
@@ -306,8 +324,10 @@ if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/"; then
         echo "2. Clean current build and retry:"
         echo "   sudo rm -rf $WORKDIR"
         echo "   $0"
-        exit 1
+        fatal_error "Insufficient disk space during rsync."
     fi
+else
+    echo -e "\n[AutoISO] System copy completed"
 fi
 
 ### Post-copy cleanup and fixes
@@ -469,15 +489,8 @@ $SUDO find "$EXTRACT_DIR/home" -type d -path "*/.config/google-chrome/*/Cache" -
 
 ### Create SquashFS filesystem
 log_info "Creating SquashFS filesystem (this may take several minutes)..."
-
-# Check space before squashfs creation
-if ! check_space 4; then
-    log_error "Insufficient space for SquashFS creation"
-    exit 1
-fi
-
-# Enhanced SquashFS compression options to reduce size
-$SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
+# Use mksquashfs with progress bar instead of verbose output
+if ! $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
     -e boot \
     -no-exports \
     -noappend \
@@ -486,7 +499,26 @@ $SUDO mksquashfs "$EXTRACT_DIR" "$CDROOT_DIR/live/filesystem.squashfs" \
     -Xdict-size 100% \
     -b 1M \
     -processors $(nproc) \
-    -progress
+    -progress 2>&1 | while IFS= read -r line; do
+    # Filter out verbose progress lines and show a simple progress indicator
+    if [[ "$line" =~ ([0-9]+\.[0-9]+)% ]]; then
+        # Extract percentage and show clean progress
+        echo -ne "\r[AutoISO] Creating SquashFS... ${BASH_REMATCH[1]}%"
+    elif [[ "$line" =~ ^[0-9]+% ]]; then
+        # Show percentage lines without estimate
+        echo -ne "\r[AutoISO] Creating SquashFS... $line"
+    elif [[ "$line" =~ "Parallel mksquashfs" ]]; then
+        # Show start message
+        echo -e "\n[AutoISO] Starting SquashFS creation with $(nproc) processors..."
+    elif [[ "$line" =~ "done" ]]; then
+        # Show completion
+        echo -e "\n[AutoISO] SquashFS creation completed"
+    fi
+done; then
+    echo -e "\n[AutoISO] SquashFS created successfully"
+else
+    fatal_error "Failed to create SquashFS filesystem"
+fi
 
 # Check final squashfs size and warn if it's very large
 SQUASHFS_SIZE=$(stat -c%s "$CDROOT_DIR/live/filesystem.squashfs" 2>/dev/null || echo "0")
