@@ -1,4 +1,4 @@
- #!/bin/bash
+#!/bin/bash
 # Ensure we're using bash
 if [ -z "$BASH_VERSION" ]; then
     echo "This script requires bash. Please run with: bash $0"
@@ -293,32 +293,60 @@ RSYNC_OPTS=(
 
 # Copy with better error handling and space monitoring
 log_info "Starting system copy with space monitoring..."
-# Use rsync with improved progress bar showing useful information
+
+# Initialize progress tracking variables
+total_files=0
+current_file=0
+current_speed=""
+current_data=""
+
+# Function to draw progress bar
+draw_progress_bar() {
+    local percent=$1
+    local width=50
+    local filled=$((width * percent / 100))
+    local empty=$((width - filled))
+    
+    printf "\r[AutoISO] ["
+    printf "%${filled}s" | tr ' ' '#'
+    printf "%${empty}s" | tr ' ' '-'
+    printf "] %3d%% | Files: %s | Speed: %s | Data: %s" "$percent" "$current_file" "$current_speed" "$current_data"
+}
+
+# Use rsync with proper progress bar
 if ! $SUDO rsync "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/" 2>&1 | while IFS= read -r line; do
-    # Show useful progress information instead of just percentages
+    # Track progress information
     if [[ "$line" =~ to-chk ]]; then
-        # Extract and show file count and transfer info
+        # Extract file count
         if [[ "$line" =~ ([0-9,]+) ]]; then
-            files_transferred="${BASH_REMATCH[1]}"
-            echo -ne "\r[AutoISO] Copying system files... ${files_transferred} files"
+            current_file="${BASH_REMATCH[1]}"
+            # Estimate progress based on file count (rough approximation)
+            if [ "$total_files" -eq 0 ]; then
+                # Try to get total file count from rsync dry-run
+                total_files=$(rsync --dry-run --stats "${RSYNC_OPTS[@]}" "${EXCLUDE_ARGS[@]}" / "$EXTRACT_DIR/" 2>/dev/null | grep "Number of files:" | awk '{print $4}' | tr -d ',')
+                [ -z "$total_files" ] && total_files=100000  # fallback estimate
+            fi
+            # Calculate percentage (capped at 95% since we don't know exact total)
+            percent=$((current_file * 95 / total_files))
+            [ "$percent" -gt 95 ] && percent=95
+            draw_progress_bar "$percent"
         fi
-    elif [[ "$line" =~ ^[0-9]+% ]]; then
-        # Show percentage with more context
-        echo -ne "\r[AutoISO] Copying system files... $line"
     elif [[ "$line" =~ ([0-9.]+[KMG]B/s) ]]; then
-        # Show transfer speed
-        speed="${BASH_REMATCH[1]}"
-        echo -ne "\r[AutoISO] Copying system files... $speed"
+        # Update transfer speed
+        current_speed="${BASH_REMATCH[1]}"
+        draw_progress_bar "$percent"
     elif [[ "$line" =~ ([0-9.]+[KMG]B) ]]; then
-        # Show data transferred
-        data="${BASH_REMATCH[1]}"
-        echo -ne "\r[AutoISO] Copying system files... $data transferred"
+        # Update data transferred
+        current_data="${BASH_REMATCH[1]}"
+        draw_progress_bar "$percent"
     elif [[ "$line" =~ ^rsync: ]]; then
         # Show rsync errors/warnings
         echo -e "\n[WARNING] $line"
     elif [[ "$line" =~ "sent" ]] && [[ "$line" =~ "received" ]]; then
-        # Show final summary
+        # Show final summary and complete the bar
         echo -e "\n[AutoISO] Transfer completed: $line"
+        draw_progress_bar 100
+        echo ""
     fi
 done; then
     echo -e "\n[AutoISO] System copy completed"
