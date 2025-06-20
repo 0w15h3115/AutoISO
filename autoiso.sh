@@ -493,7 +493,10 @@ SQUASHFS_SIZE=$(stat -c%s "$CDROOT_DIR/live/filesystem.squashfs" 2>/dev/null || 
 SQUASHFS_SIZE_GB=$((SQUASHFS_SIZE / 1024 / 1024 / 1024))
 
 if [ "$SQUASHFS_SIZE_GB" -gt 4 ]; then
-    log_warning "SquashFS is ${SQUASHFS_SIZE_GB}GB - using xorriso for large file support"
+    log_warning "SquashFS is ${SQUASHFS_SIZE_GB}GB - using UDF filesystem for large file support"
+    USE_UDF=true
+else
+    USE_UDF=false
 fi
 
 ### Copy kernel and initrd
@@ -613,46 +616,99 @@ fi
 
 # Use xorriso with proper error handling - FIXED: Using dynamic ISOHDPFX_BIN path
 log_info "Using xorriso for enhanced large file support..."
-if $SUDO xorriso -as mkisofs \
-    -o "$WORKDIR/$ISO_NAME" \
-    -isohybrid-mbr "$ISOHDPFX_BIN" \
-    -c boot/isolinux/boot.cat \
-    -b boot/isolinux/isolinux.bin \
-    -no-emul-boot -boot-load-size 4 -boot-info-table \
-    -eltorito-alt-boot \
-    -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
-    -joliet-long \
-    -allow-leading-dots \
-    -relaxed-filenames \
-    -allow-lowercase \
-    -allow-multidot \
-    -max-iso9660-filenames \
-    -full-iso9660-filenames \
-    .; then
-    log_info "ISO created successfully with xorriso"
-else
-    # Improved fallback with better error handling
-    log_warning "xorriso failed, falling back to genisoimage..."
-    if $SUDO genisoimage \
+if [ "$USE_UDF" = true ]; then
+    # For large files, use xorriso with UDF support
+    if $SUDO xorriso -as mkisofs \
         -o "$WORKDIR/$ISO_NAME" \
-        -b boot/isolinux/isolinux.bin \
+        -isohybrid-mbr "$ISOHDPFX_BIN" \
         -c boot/isolinux/boot.cat \
+        -b boot/isolinux/isolinux.bin \
         -no-emul-boot -boot-load-size 4 -boot-info-table \
+        -eltorito-alt-boot \
+        -e EFI/BOOT/efiboot.img \
+        -no-emul-boot \
+        -isohybrid-gpt-basdat \
+        -append_partition 2 0xef "$CDROOT_DIR/efiboot.img" \
         -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
+        -joliet-long \
         -allow-leading-dots \
         -relaxed-filenames \
         -allow-lowercase \
         -allow-multidot \
         -max-iso9660-filenames \
-        -joliet-long \
         -full-iso9660-filenames \
-        -allow-limited-size \
         -udf \
         .; then
-        log_info "ISO created successfully with genisoimage"
+        log_info "ISO created successfully with xorriso (UEFI+BIOS, UDF for large files)"
     else
-        log_error "Both xorriso and genisoimage failed to create ISO"
-        exit 1
+        log_warning "xorriso with UDF failed, falling back to genisoimage..."
+        if $SUDO genisoimage \
+            -o "$WORKDIR/$ISO_NAME" \
+            -b boot/isolinux/isolinux.bin \
+            -c boot/isolinux/boot.cat \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
+            -allow-leading-dots \
+            -relaxed-filenames \
+            -allow-lowercase \
+            -allow-multidot \
+            -max-iso9660-filenames \
+            -joliet-long \
+            -full-iso9660-filenames \
+            -allow-limited-size \
+            -udf \
+            .; then
+            log_info "ISO created successfully with genisoimage (BIOS only, UDF)"
+        else
+            fatal_error "Both xorriso and genisoimage failed to create ISO"
+        fi
+    fi
+else
+    # For smaller files, use standard ISO-9660
+    if $SUDO xorriso -as mkisofs \
+        -o "$WORKDIR/$ISO_NAME" \
+        -isohybrid-mbr "$ISOHDPFX_BIN" \
+        -c boot/isolinux/boot.cat \
+        -b boot/isolinux/isolinux.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table \
+        -eltorito-alt-boot \
+        -e EFI/BOOT/efiboot.img \
+        -no-emul-boot \
+        -isohybrid-gpt-basdat \
+        -append_partition 2 0xef "$CDROOT_DIR/efiboot.img" \
+        -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
+        -joliet-long \
+        -allow-leading-dots \
+        -relaxed-filenames \
+        -allow-lowercase \
+        -allow-multidot \
+        -max-iso9660-filenames \
+        -full-iso9660-filenames \
+        .; then
+        log_info "ISO created successfully with xorriso (UEFI+BIOS)"
+    else
+        # Improved fallback with better error handling
+        log_warning "xorriso failed, falling back to genisoimage..."
+        if $SUDO genisoimage \
+            -o "$WORKDIR/$ISO_NAME" \
+            -b boot/isolinux/isolinux.bin \
+            -c boot/isolinux/boot.cat \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -J -R -l -V "AutoISO-$(date +%Y%m%d)" \
+            -allow-leading-dots \
+            -relaxed-filenames \
+            -allow-lowercase \
+            -allow-multidot \
+            -max-iso9660-filenames \
+            -joliet-long \
+            -full-iso9660-filenames \
+            -allow-limited-size \
+            -udf \
+            .; then
+            log_info "ISO created successfully with genisoimage (BIOS only)"
+        else
+            fatal_error "Both xorriso and genisoimage failed to create ISO"
+        fi
     fi
 fi
 
