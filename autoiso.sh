@@ -1,9 +1,11 @@
 #!/bin/bash
-# AutoISO
+# Enhanced AutoISO - More Reliable Than Cubic
+# Key improvements: State management, error recovery, validation, and atomic operations
+
 set -euo pipefail  # Stricter error handling
 
 # ========================================
-#              AUTOISO 
+#    ENHANCED AUTOISO - RELIABILITY FIRST
 # ========================================
 
 # Global state tracking
@@ -644,7 +646,9 @@ check_system_resources() {
     load_avg=$(uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',' || echo "0")
     
     if command -v bc >/dev/null 2>&1; then
-        if (( $(echo "$load_avg > 10" | bc -l 2>/dev/null || echo 0) )); then
+        local load_check
+        load_check=$(echo "$load_avg > 10" | bc -l 2>/dev/null || echo 0)
+        if [[ "$load_check" == "1" ]]; then
             warnings+=("High system load: $load_avg")
         fi
     fi
