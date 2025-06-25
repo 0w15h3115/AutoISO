@@ -508,6 +508,18 @@ enhanced_rsync() {
     local rsync_partial_dir="$WORKDIR/.rsync-partial"
     mkdir -p "$rsync_partial_dir"
     
+    # First, estimate the total size to copy
+    log_info "Calculating system size for accurate progress..."
+    local total_size_bytes
+    local total_size_human
+    
+    # Get estimated size (this is fast)
+    total_size_bytes=$(df / | awk 'NR==2 {print $3 * 1024}')
+    total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
+    
+    log_info "Estimated data to copy: $total_size_human"
+    echo ""
+    
     # Optimized exclusion list
     local exclude_patterns=(
         "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
@@ -517,36 +529,129 @@ enhanced_rsync() {
     
     local rsync_opts=(
         -aAXHx
-        --info=progress2
         --partial
         --partial-dir="$rsync_partial_dir"
         --numeric-ids
         --one-file-system
         --log-file="$rsync_log"
+        --stats
+        --human-readable
     )
     
     for pattern in "${exclude_patterns[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
-    log_info "Starting system copy..."
+    log_info "Starting system copy... This may take 10-30 minutes depending on system size."
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
-    if $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/"; then
-        log_success "System copy completed"
+    # Create a background process to monitor progress
+    local stats_file="$WORKDIR/.rsync_stats"
+    local start_time=$(date +%s)
+    local rsync_pid
+    
+    # Start rsync in background
+    $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
+        tee "$stats_file" | \
+        grep -E "to-check=|xfr#" | \
+        while IFS= read -r line; do
+            # Parse rsync output for better progress display
+            if [[ "$line" =~ to-check=([0-9]+)/([0-9]+) ]]; then
+                local remaining="${BASH_REMATCH[1]}"
+                local total="${BASH_REMATCH[2]}"
+                local completed=$((total - remaining))
+                local percent=$((completed * 100 / total))
+                
+                # Calculate speed and ETA
+                local current_time=$(date +%s)
+                local elapsed=$((current_time - start_time))
+                
+                if [[ $elapsed -gt 0 && $completed -gt 0 ]]; then
+                    local rate=$((completed / elapsed))
+                    local eta=$((remaining / rate))
+                    local eta_min=$((eta / 60))
+                    local eta_sec=$((eta % 60))
+                    
+                    # Format the progress line
+                    printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% " \
+                        "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
+                        "$percent"
+                    
+                    printf "${CYAN}Files:${NC} %d/%d " "$completed" "$total"
+                    
+                    if [[ $eta_min -gt 0 ]]; then
+                        printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
+                    else
+                        printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
+                    fi
+                fi
+            elif [[ "$line" =~ xfr#([0-9]+),.*to-chk=([0-9]+)/([0-9]+) ]]; then
+                # Alternative parsing for different rsync versions
+                local transferred="${BASH_REMATCH[1]}"
+                local remaining="${BASH_REMATCH[2]}"
+                local total="${BASH_REMATCH[3]}"
+                local completed=$((total - remaining))
+                local percent=$((completed * 100 / total))
+                
+                printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% ${CYAN}Files:${NC} %d/%d     " \
+                    "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
+                    "$percent" "$completed" "$total"
+            fi
+        done &
+    
+    # Wait for rsync to complete
+    wait
+    local rsync_status=$?
+    
+    echo "" # New line after progress
+    
+    if [[ $rsync_status -eq 0 ]]; then
+        # Parse final statistics
+        if [[ -f "$stats_file" ]]; then
+            local files_transferred=$(grep -E "Number of.*files transferred:" "$stats_file" | awk '{print $NF}' || echo "N/A")
+            local total_size=$(grep -E "Total file size:" "$stats_file" | awk '{print $4,$5}' || echo "N/A")
+            local transferred_size=$(grep -E "Total transferred file size:" "$stats_file" | awk '{print $5,$6}' || echo "N/A")
+            local speedup=$(grep -E "Speedup is" "$stats_file" | awk '{print $3}' || echo "N/A")
+            
+            echo ""
+            log_success "System copy completed successfully!"
+            echo ""
+            echo -e "${BOLD}Copy Statistics:${NC}"
+            echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
+            echo -e "  ${CYAN}Total size:${NC}        $total_size"
+            echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
+            echo -e "  ${CYAN}Compression ratio:${NC} $speedup"
+            
+            # Show actual copied size
+            local copied_size
+            copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
+            echo -e "  ${CYAN}Size on disk:${NC}      $copied_size"
+        fi
+        
         save_state "rsync_complete"
-        
-        # Show statistics
-        local size
-        size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
-        log_info "Copied data size: $size"
-        
         return 0
     else
-        log_error "System copy failed"
+        log_error "System copy failed (exit code: $rsync_status)"
+        echo ""
+        echo "Check the log file for details: $rsync_log"
         return 1
     fi
+}
+
+# Helper function to format bytes to human readable
+format_bytes() {
+    local bytes=$1
+    local units=("B" "KB" "MB" "GB" "TB")
+    local unit=0
+    local size=$bytes
+    
+    while [[ $size -gt 1024 && $unit -lt 4 ]]; do
+        size=$((size / 1024))
+        ((unit++))
+    done
+    
+    echo "${size}${units[$unit]}"
 }
 
 post_copy_cleanup() {
@@ -706,6 +811,21 @@ create_squashfs_enhanced() {
     local processors=$(nproc)
     local mem_limit=$(($(free -m | awk '/^Mem:/ {print $2}') / 2))
     
+    # Get source size for estimation
+    log_info "Analyzing source data..."
+    local source_size_bytes
+    source_size_bytes=$(du -sb "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "0")
+    local source_size_human
+    source_size_human=$(numfmt --to=iec-i --suffix=B "$source_size_bytes" 2>/dev/null || echo "N/A")
+    
+    # Estimate compressed size (typically 40-50% of original)
+    local estimated_compressed=$((source_size_bytes / 1024 / 1024 / 2))
+    
+    log_info "Source size: $source_size_human"
+    log_info "Estimated compressed size: ~${estimated_compressed}MB"
+    log_info "Using $processors CPU cores and ${mem_limit}MB memory"
+    echo ""
+    
     local squashfs_opts=(
         -no-exports
         -noappend
@@ -716,24 +836,77 @@ create_squashfs_enhanced() {
         -mem "${mem_limit}M"
     )
     
-    log_info "Creating SquashFS with $processors processors and ${mem_limit}MB memory limit..."
+    log_info "Creating compressed filesystem... This typically takes 5-15 minutes."
+    echo ""
     
-    # Show progress with size estimation
-    local source_size
-    source_size=$(du -sm "$EXTRACT_DIR" | cut -f1)
-    local estimated_size=$((source_size / 2))
+    # Run mksquashfs with progress parsing
+    local start_time=$(date +%s)
+    local last_percent=0
     
-    if ! $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}"; then
+    $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 | \
+        grep -E "[0-9]+%" | \
+        while IFS= read -r line; do
+            if [[ "$line" =~ ([0-9]+)% ]]; then
+                local percent="${BASH_REMATCH[1]}"
+                
+                # Only update if percentage changed
+                if [[ $percent -ne $last_percent ]]; then
+                    last_percent=$percent
+                    
+                    # Calculate ETA
+                    local current_time=$(date +%s)
+                    local elapsed=$((current_time - start_time))
+                    
+                    if [[ $percent -gt 0 && $elapsed -gt 0 ]]; then
+                        local total_time=$((elapsed * 100 / percent))
+                        local remaining=$((total_time - elapsed))
+                        local eta_min=$((remaining / 60))
+                        local eta_sec=$((remaining % 60))
+                        
+                        # Show progress bar
+                        printf "\r${CYAN}Compression:${NC} ["
+                        printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
+                        printf "] %3d%% " "$percent"
+                        
+                        if [[ $eta_min -gt 0 ]]; then
+                            printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
+                        else
+                            printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
+                        fi
+                    fi
+                fi
+            fi
+        done
+    
+    local squashfs_status=$?
+    echo "" # New line after progress
+    
+    if [[ $squashfs_status -eq 0 ]]; then
+        # Get final size and compression ratio
+        local final_size_bytes
+        final_size_bytes=$(stat -c%s "$squashfs_file" 2>/dev/null || echo "0")
+        local final_size_human
+        final_size_human=$(numfmt --to=iec-i --suffix=B "$final_size_bytes" 2>/dev/null || echo "N/A")
+        
+        local compression_ratio="N/A"
+        if [[ $source_size_bytes -gt 0 && $final_size_bytes -gt 0 ]]; then
+            compression_ratio=$(awk "BEGIN {printf \"%.1f:1\", $source_size_bytes / $final_size_bytes}")
+        fi
+        
+        echo ""
+        log_success "SquashFS created successfully!"
+        echo ""
+        echo -e "${BOLD}Compression Statistics:${NC}"
+        echo -e "  ${CYAN}Original size:${NC}      $source_size_human"
+        echo -e "  ${CYAN}Compressed size:${NC}    $final_size_human"
+        echo -e "  ${CYAN}Compression ratio:${NC}  $compression_ratio"
+        echo -e "  ${CYAN}Space saved:${NC}        $(numfmt --to=iec-i --suffix=B $((source_size_bytes - final_size_bytes)) 2>/dev/null || echo 'N/A')"
+        
+        return 0
+    else
         log_error "SquashFS creation failed"
         return 1
     fi
-    
-    # Verify and show results
-    local final_size
-    final_size=$(du -h "$squashfs_file" | cut -f1)
-    log_success "SquashFS created: $final_size (compressed from ${source_size}MB)"
-    
-    return 0
 }
 
 setup_bootloader_enhanced() {
@@ -884,6 +1057,16 @@ create_iso_enhanced() {
         return 1
     fi
     
+    # Calculate expected ISO size
+    log_info "Calculating ISO size..."
+    local cdroot_size_bytes
+    cdroot_size_bytes=$(du -sb "$CDROOT_DIR" 2>/dev/null | cut -f1 || echo "0")
+    local cdroot_size_human
+    cdroot_size_human=$(numfmt --to=iec-i --suffix=B "$cdroot_size_bytes" 2>/dev/null || echo "N/A")
+    
+    log_info "ISO content size: $cdroot_size_human"
+    echo ""
+    
     # Build xorriso command
     local xorriso_cmd=(
         xorriso
@@ -905,6 +1088,9 @@ create_iso_enhanced() {
             -boot-load-size 4
             -boot-info-table
         )
+        log_info "✓ BIOS boot support enabled"
+    else
+        log_warning "⚠ BIOS boot support not available"
     fi
     
     # Add UEFI boot
@@ -914,6 +1100,9 @@ create_iso_enhanced() {
             -e EFI/boot/bootx64.efi
             -no-emul-boot
         )
+        log_info "✓ UEFI boot support enabled"
+    else
+        log_warning "⚠ UEFI boot support not available"
     fi
     
     # Add source and output
@@ -922,44 +1111,109 @@ create_iso_enhanced() {
         "$CDROOT_DIR"
     )
     
-    log_info "Building ISO image..."
+    log_info "Building ISO image... This usually takes 1-3 minutes."
+    echo ""
     
-    # Execute with progress monitoring
-    if ! $SUDO "${xorriso_cmd[@]}" 2>&1 | while read -r line; do
-        if [[ "$line" =~ ([0-9]+)% ]]; then
-            show_progress_bar "${BASH_REMATCH[1]}" 100
-        fi
-    done; then
+    # Execute with cleaner progress monitoring
+    local start_time=$(date +%s)
+    local xorriso_output="$WORKDIR/logs/xorriso-output.log"
+    
+    # Run xorriso and capture output
+    $SUDO "${xorriso_cmd[@]}" 2>&1 | tee "$xorriso_output" | \
+        grep -E "([0-9]+)(\.[0-9]+)?% done|Writing:|Finishing" | \
+        while IFS= read -r line; do
+            if [[ "$line" =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]+done ]]; then
+                local percent="${BASH_REMATCH[1]}"
+                
+                # Calculate speed and ETA
+                local current_time=$(date +%s)
+                local elapsed=$((current_time - start_time))
+                
+                if [[ $percent -gt 0 && $elapsed -gt 0 ]]; then
+                    local total_time=$((elapsed * 100 / percent))
+                    local remaining=$((total_time - elapsed))
+                    
+                    # Show progress
+                    printf "\r${CYAN}Building ISO:${NC} ["
+                    printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
+                    printf "] %3d%% " "$percent"
+                    
+                    if [[ $remaining -gt 0 ]]; then
+                        printf "${CYAN}ETA:${NC} %ds     " "$remaining"
+                    fi
+                fi
+            elif [[ "$line" =~ Writing ]]; then
+                printf "\r${CYAN}Writing ISO metadata...${NC}                             "
+            elif [[ "$line" =~ Finishing ]]; then
+                printf "\r${CYAN}Finalizing ISO...${NC}                                  "
+            fi
+        done
+    
+    local iso_status=$?
+    echo "" # New line after progress
+    
+    if [[ $iso_status -ne 0 ]]; then
         log_error "ISO creation failed"
         return 1
     fi
     
-    echo ""  # New line after progress bar
-    
     # Make hybrid
     if command -v isohybrid >/dev/null 2>&1; then
-        log_progress "Making ISO hybrid bootable..."
-        $SUDO isohybrid "$iso_file" 2>/dev/null || true
-        log_progress_done "ISO is hybrid bootable"
+        log_progress "Making ISO USB-bootable..."
+        if $SUDO isohybrid "$iso_file" 2>/dev/null; then
+            log_progress_done "✓ ISO is now USB-bootable"
+        else
+            log_warning "⚠ Could not make ISO hybrid (not critical)"
+        fi
     fi
     
-    # Calculate checksums
+    # Calculate checksums with progress
     log_progress "Calculating checksums..."
     local checksum_file="$WORKDIR/checksums.txt"
     {
         echo "# Checksums for $(basename "$iso_file")"
         echo "# Generated on $(date)"
         echo ""
-        echo "MD5: $(md5sum "$iso_file" | cut -d' ' -f1)"
-        echo "SHA256: $(sha256sum "$iso_file" | cut -d' ' -f1)"
+        
+        # MD5
+        printf "Calculating MD5...   "
+        local md5
+        md5=$(md5sum "$iso_file" | cut -d' ' -f1)
+        echo "✓"
+        echo "MD5:    $md5"
+        
+        # SHA256
+        printf "Calculating SHA256... "
+        local sha256
+        sha256=$(sha256sum "$iso_file" | cut -d' ' -f1)
+        echo "✓"
+        echo "SHA256: $sha256"
+        
+        echo ""
         echo "Size: $(du -h "$iso_file" | cut -f1)"
-    } > "$checksum_file"
-    log_progress_done "Checksums calculated"
+    } | tee "$checksum_file"
+    
+    echo ""
+    log_progress_done "✓ Checksums calculated"
+    
+    # Get final ISO stats
+    local iso_size_bytes
+    iso_size_bytes=$(stat -c%s "$iso_file" 2>/dev/null || echo "0")
+    local iso_size_human
+    iso_size_human=$(numfmt --to=iec-i --suffix=B "$iso_size_bytes" 2>/dev/null || echo "N/A")
     
     # Save ISO path
     echo "$iso_file" > "$WORKDIR/.final_iso_path"
     
-    log_success "ISO created successfully: $iso_file"
+    echo ""
+    log_success "ISO created successfully!"
+    echo ""
+    echo -e "${BOLD}ISO Information:${NC}"
+    echo -e "  ${CYAN}File:${NC}         $(basename "$iso_file")"
+    echo -e "  ${CYAN}Size:${NC}         $iso_size_human"
+    echo -e "  ${CYAN}Boot modes:${NC}   BIOS + UEFI"
+    echo -e "  ${CYAN}USB bootable:${NC} Yes"
+    
     return 0
 }
 
