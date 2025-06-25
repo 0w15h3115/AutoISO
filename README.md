@@ -407,12 +407,6 @@ A: Yes, but ensure you comply with the licenses of all included software.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](#license) section below for details.
-
----
-
-## License
-
 MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
