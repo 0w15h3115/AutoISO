@@ -1,11 +1,9 @@
 #!/bin/bash
-# Enhanced AutoISO - More Reliable Than Cubic
-# Key improvements: State management, error recovery, validation, and atomic operations
-
+# AutoISO
 set -euo pipefail  # Stricter error handling
 
 # ========================================
-#    ENHANCED AUTOISO - RELIABILITY FIRST
+#              AUTOISO 
 # ========================================
 
 # Global state tracking
