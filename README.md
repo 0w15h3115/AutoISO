@@ -6,7 +6,7 @@ AutoISO is a comprehensive bash script that creates persistent bootable Linux IS
 
 Tested with a separate external 5TB HDD
 
-Created with Claude
+Created with Claude Opus
 
 ## Features
 
