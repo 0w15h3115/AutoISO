@@ -1,5 +1,5 @@
 #!/bin/bash
-# Enhanced AutoISO v3.0.0 - Professional Live ISO Creator
+# Enhanced AutoISO v3.1.0 - Professional Live ISO Creator with Kali Linux Support
 # Optimized for reliability, performance, and user experience
 
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -21,6 +21,7 @@ declare -A SCRIPT_STATE=(
     [cleanup_required]="false"
     [mounts_active]="false"
     [start_time]=$(date +%s)
+    [distribution]=""
 )
 
 # Color codes for better UX
@@ -135,6 +136,7 @@ MOUNTS_ACTIVE=${SCRIPT_STATE[mounts_active]}
 WORKDIR=$WORKDIR
 TIMESTAMP=$(date +%s)
 START_TIME=${SCRIPT_STATE[start_time]}
+DISTRIBUTION=${SCRIPT_STATE[distribution]}
 PID=$$
 EOF
     log_debug "State saved: $stage"
@@ -147,6 +149,7 @@ load_state() {
         SCRIPT_STATE[cleanup_required]="$CLEANUP_REQUIRED"
         SCRIPT_STATE[mounts_active]="$MOUNTS_ACTIVE"
         SCRIPT_STATE[start_time]="${START_TIME:-$(date +%s)}"
+        SCRIPT_STATE[distribution]="${DISTRIBUTION:-}"
         log_info "Loaded previous state: ${SCRIPT_STATE[stage]}"
         return 0
     fi
@@ -284,9 +287,19 @@ validate_distribution() {
     if [[ -f /etc/os-release ]]; then
         source /etc/os-release
         log_debug "Detected: $NAME $VERSION"
+        SCRIPT_STATE[distribution]="$ID"
         
         case "$ID" in
             ubuntu|debian|linuxmint|pop|elementary|zorin)
+                log_info "Distribution '$NAME' is fully supported"
+                return 0
+                ;;
+            kali)
+                log_info "Distribution 'Kali Linux' detected - using Kali-specific configuration"
+                return 0
+                ;;
+            parrot)
+                log_info "Distribution 'Parrot OS' detected - using Debian-based configuration"
                 return 0
                 ;;
             *)
@@ -339,6 +352,12 @@ validate_space_detailed() {
     local system_size_kb
     system_size_kb=$(calculate_system_size_smart)
     local system_size_gb=$((system_size_kb / 1024 / 1024))
+    
+    # Kali typically needs more space
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        system_size_gb=$((system_size_gb + 5))
+        log_info "Adding extra space for Kali Linux tools"
+    fi
     
     # Calculate space requirements with detailed breakdown
     local space_breakdown=(
@@ -401,8 +420,12 @@ calculate_system_size_smart() {
         return 0
     fi
     
-    # Method 3: Conservative estimate
-    echo $((15 * 1024 * 1024))  # 15GB default
+    # Method 3: Conservative estimate (higher for Kali)
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        echo $((20 * 1024 * 1024))  # 20GB default for Kali
+    else
+        echo $((15 * 1024 * 1024))  # 15GB default for others
+    fi
 }
 
 calculate_size_du() {
@@ -447,6 +470,11 @@ suggest_space_solutions_enhanced() {
     echo "3. 📁 Check other partitions:"
     echo "   df -h | grep -E '^/dev/' | sort -k4 -h -r"
     echo ""
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        echo "4. 🔧 For Kali: Remove unnecessary tools:"
+        echo "   sudo apt-get remove --purge kali-tools-*"
+        echo ""
+    fi
     echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
@@ -520,12 +548,21 @@ enhanced_rsync() {
     log_info "Estimated data to copy: $total_size_human"
     echo ""
     
-    # Optimized exclusion list
+    # Optimized exclusion list with Kali-specific additions
     local exclude_patterns=(
         "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
         "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
         "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
     )
+    
+    # Add Kali-specific exclusions if needed
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        exclude_patterns+=(
+            "/root/.cache"
+            "/root/.local/share/Trash"
+            "/opt/metasploit-framework/embedded/framework/.git"
+        )
+    fi
     
     local rsync_opts=(
         -aAXHx
@@ -665,6 +702,11 @@ post_copy_cleanup() {
         "Machine IDs:clean_machine_ids"
     )
     
+    # Add Kali-specific cleanup
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        cleanup_tasks+=("Kali histories:clean_kali_specific")
+    fi
+    
     for task in "${cleanup_tasks[@]}"; do
         local desc="${task%:*}"
         local func="${task#*:}"
@@ -700,6 +742,16 @@ clean_machine_ids() {
     $SUDO rm -f "$EXTRACT_DIR/var/lib/dbus/machine-id"
 }
 
+clean_kali_specific() {
+    # Clean Kali-specific histories and caches
+    $SUDO rm -f "$EXTRACT_DIR/root/.zsh_history"
+    $SUDO rm -f "$EXTRACT_DIR/root/.bash_history"
+    $SUDO rm -rf "$EXTRACT_DIR/root/.cache/mozilla"
+    $SUDO rm -rf "$EXTRACT_DIR/root/.cache/chromium"
+    $SUDO rm -rf "$EXTRACT_DIR/root/.msf4/logs"
+    $SUDO rm -rf "$EXTRACT_DIR/var/lib/postgresql/*/main/pg_log/"*
+}
+
 configure_chroot_enhanced() {
     show_header "Chroot Configuration"
     
@@ -715,7 +767,13 @@ configure_chroot_enhanced() {
     
     # Create and execute chroot script
     local chroot_script="$EXTRACT_DIR/tmp/configure_system.sh"
-    create_chroot_script "$chroot_script"
+    
+    # Create distribution-specific chroot script
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        create_chroot_script_kali "$chroot_script"
+    else
+        create_chroot_script "$chroot_script"
+    fi
     
     log_progress "Installing live system packages..."
     if ! $SUDO chroot "$EXTRACT_DIR" /bin/bash /tmp/configure_system.sh; then
@@ -797,6 +855,71 @@ apt-get autoremove -y || true
 apt-get autoclean || true
 
 echo "[CHROOT] Configuration complete"
+CHROOT_SCRIPT
+
+    $SUDO chmod +x "$script_path"
+}
+
+create_chroot_script_kali() {
+    local script_path="$1"
+    
+    $SUDO tee "$script_path" > /dev/null << 'CHROOT_SCRIPT'
+#!/bin/bash
+set -e
+
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+
+echo "[CHROOT] Kali Linux specific configuration..."
+
+# Update package database
+echo "[CHROOT] Updating package database..."
+apt-get update || true
+
+# Kali-specific packages for live system
+PACKAGES=(
+    live-boot
+    live-boot-initramfs-tools
+    live-config
+    live-config-systemd
+    linux-image-amd64
+    systemd-sysv
+    network-manager
+    wpasupplicant
+    firmware-linux
+    firmware-linux-nonfree
+    firmware-misc-nonfree
+)
+
+echo "[CHROOT] Installing Kali live system packages..."
+for pkg in "${PACKAGES[@]}"; do
+    echo "[CHROOT] Installing: $pkg"
+    apt-get install -y "$pkg" || echo "[CHROOT] Warning: Failed to install $pkg"
+done
+
+# Configure locales
+echo "[CHROOT] Configuring locales..."
+locale-gen en_US.UTF-8 || true
+update-locale LANG=en_US.UTF-8 || true
+
+# Update initramfs for live boot
+echo "[CHROOT] Updating initramfs for live boot..."
+update-initramfs -u || update-initramfs -c -k all || true
+
+# Configure live-boot
+echo "[CHROOT] Configuring live-boot..."
+cat > /etc/live/config.conf << EOF
+LIVE_HOSTNAME="kali"
+LIVE_USERNAME="kali"
+LIVE_USER_FULLNAME="Kali Live User"
+LIVE_USER_DEFAULT_GROUPS="audio cdrom dialout floppy video plugdev netdev sudo"
+EOF
+
+# Clean up
+apt-get autoremove -y || true
+apt-get autoclean || true
+
+echo "[CHROOT] Kali configuration complete"
 CHROOT_SCRIPT
 
     $SUDO chmod +x "$script_path"
@@ -946,8 +1069,19 @@ copy_kernel_files() {
         if [[ -f "$source" ]]; then
             $SUDO cp "$source" "$dest"
         else
-            log_error "Not found: $source"
-            return 1
+            # Try alternative locations for Kali
+            if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+                source="/boot/$file"
+                if [[ -f "$source" ]]; then
+                    $SUDO cp "$source" "$dest"
+                else
+                    log_error "Not found: $source or /boot/$file-$kernel_version"
+                    return 1
+                fi
+            else
+                log_error "Not found: $source"
+                return 1
+            fi
         fi
     done
     
@@ -972,7 +1106,17 @@ setup_isolinux() {
         fi
     done
     
-    # Create ISOLINUX config
+    # Create distribution-specific ISOLINUX config
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        setup_isolinux_kali
+    else
+        setup_isolinux_default
+    fi
+    
+    return 0
+}
+
+setup_isolinux_default() {
     $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null << 'EOF'
 DEFAULT live
 TIMEOUT 300
@@ -985,8 +1129,36 @@ LABEL check
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd boot=casper integrity-check quiet splash ---
 EOF
-    
-    return 0
+}
+
+setup_isolinux_kali() {
+    $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null << 'EOF'
+UI menu.c32
+PROMPT 0
+MENU TITLE Kali Linux Live Boot Menu
+TIMEOUT 300
+
+LABEL live
+  MENU LABEL ^Live (amd64)
+  MENU DEFAULT
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components quiet splash
+
+LABEL live-forensic
+  MENU LABEL Live (^forensic mode)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components noswap noautomount
+
+LABEL live-persistence
+  MENU LABEL ^Live USB Persistence
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components persistence persistence-encryption=luks quiet splash
+
+LABEL live-encrypted-persistence
+  MENU LABEL ^Live USB Encrypted Persistence
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=live components persistent=cryptsetup persistence-encryption=luks quiet splash
+EOF
 }
 
 setup_grub_uefi() {
@@ -999,6 +1171,8 @@ setup_grub_uefi() {
         "/usr/lib/grub/x86_64-efi/grubx64.efi"
         "/boot/efi/EFI/ubuntu/grubx64.efi"
         "/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed"
+        "/boot/efi/EFI/kali/grubx64.efi"
+        "/usr/lib/grub/x86_64-efi-signed/grubx64.efi"
     )
     
     local found=false
@@ -1014,8 +1188,18 @@ setup_grub_uefi() {
         log_warning "GRUB EFI not found - UEFI boot may not work"
     fi
     
-    # Create GRUB config
-    $SUDO tee "$efi_dir/grub.cfg" > /dev/null << 'EOF'
+    # Create distribution-specific GRUB config
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        setup_grub_kali
+    else
+        setup_grub_default
+    fi
+    
+    return 0
+}
+
+setup_grub_default() {
+    $SUDO tee "$CDROOT_DIR/EFI/boot/grub.cfg" > /dev/null << 'EOF'
 set timeout=30
 set default=0
 
@@ -1024,8 +1208,28 @@ menuentry "Live System" {
     initrd /live/initrd
 }
 EOF
-    
-    return 0
+}
+
+setup_grub_kali() {
+    $SUDO tee "$CDROOT_DIR/EFI/boot/grub.cfg" > /dev/null << 'EOF'
+set timeout=30
+set default=0
+
+menuentry "Kali Live" {
+    linux /live/vmlinuz boot=live components quiet splash
+    initrd /live/initrd
+}
+
+menuentry "Kali Live (forensic mode)" {
+    linux /live/vmlinuz boot=live components noswap noautomount
+    initrd /live/initrd
+}
+
+menuentry "Kali Live (persistence)" {
+    linux /live/vmlinuz boot=live components persistence persistence-encryption=luks quiet splash
+    initrd /live/initrd
+}
+EOF
 }
 
 create_iso_metadata() {
@@ -1039,7 +1243,15 @@ create_iso_metadata() {
     
     # Create .disk info
     $SUDO mkdir -p "$CDROOT_DIR/.disk"
-    echo "Ubuntu Live CD - Built $(date '+%Y-%m-%d')" | $SUDO tee "$CDROOT_DIR/.disk/info" >/dev/null
+    
+    local distro_name="Ubuntu"
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        distro_name="Kali Linux"
+    elif [[ "${SCRIPT_STATE[distribution]}" == "debian" ]]; then
+        distro_name="Debian"
+    fi
+    
+    echo "$distro_name Live CD - Built $(date '+%Y-%m-%d')" | $SUDO tee "$CDROOT_DIR/.disk/info" >/dev/null
     
     return 0
 }
@@ -1047,8 +1259,15 @@ create_iso_metadata() {
 create_iso_enhanced() {
     show_header "Creating ISO Image"
     
-    local iso_file="$WORKDIR/ubuntu-live-$(date +%Y%m%d-%H%M).iso"
-    local volume_label="Ubuntu_Live_$(date +%Y%m%d)"
+    local distro_label="ubuntu"
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        distro_label="kali"
+    elif [[ "${SCRIPT_STATE[distribution]}" == "debian" ]]; then
+        distro_label="debian"
+    fi
+    
+    local iso_file="$WORKDIR/${distro_label}-live-$(date +%Y%m%d-%H%M).iso"
+    local volume_label="${distro_label^}_Live_$(date +%Y%m%d)"
     
     # Pre-flight checks
     if ! command -v xorriso >/dev/null 2>&1; then
@@ -1258,7 +1477,7 @@ show_welcome() {
 EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
-    echo -e "${CYAN}Creating bootable Ubuntu/Debian live ISOs with style${NC}"
+    echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
     echo ""
 }
 
@@ -1273,6 +1492,15 @@ show_usage() {
     echo ""
     echo "Arguments:"
     echo "  WORK_DIRECTORY    Directory for build files (default: $DEFAULT_WORKDIR)"
+    echo ""
+    echo "Supported Distributions:"
+    echo "  - Ubuntu and derivatives (Ubuntu, Kubuntu, Xubuntu, etc.)"
+    echo "  - Debian"
+    echo "  - Kali Linux"
+    echo "  - Linux Mint"
+    echo "  - Pop!_OS"
+    echo "  - Elementary OS"
+    echo "  - Zorin OS"
     echo ""
     echo "Examples:"
     echo "  $0                           # Use default directory"
@@ -1310,6 +1538,15 @@ show_summary() {
     echo "2. Create bootable USB:"
     echo "   ${BOLD}sudo dd if='${iso_path:-$WORKDIR/*.iso}' of=/dev/sdX bs=4M status=progress${NC}"
     echo "3. Or use GUI tools: Rufus (Windows), Etcher, or Ventoy"
+    
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        echo ""
+        echo -e "${PURPLE}${BOLD}Kali-specific notes:${NC}"
+        echo "- Default username: kali"
+        echo "- Default password: kali"
+        echo "- For persistence, create a partition labeled 'persistence'"
+    fi
+    
     echo ""
     echo -e "${GREEN}Thank you for using AutoISO! 🎉${NC}"
 }
