@@ -1,5 +1,5 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.0 - Professional Live ISO Creator with Kali Linux Support
+# Enhanced AutoISO v3.1.1 - Professional Live ISO Creator with Kali Linux Support
 # Optimized for reliability, performance, and user experience
 
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.1.1"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -249,6 +249,28 @@ trap cleanup_all EXIT INT TERM
 #    VALIDATION FUNCTIONS
 # ========================================
 
+list_available_kernels() {
+    log_info "Available kernels on this system:"
+    
+    # List vmlinuz files
+    echo "Kernel images (vmlinuz):"
+    ls -la /boot/vmlinuz* 2>/dev/null | awk '{print "  " $NF}' || echo "  None found in /boot/"
+    ls -la /vmlinuz* 2>/dev/null | awk '{print "  " $NF}' || true
+    
+    echo ""
+    echo "Initrd images:"
+    ls -la /boot/initrd* 2>/dev/null | awk '{print "  " $NF}' || echo "  None found in /boot/"
+    ls -la /initrd* 2>/dev/null | awk '{print "  " $NF}' || true
+    
+    echo ""
+    echo "Installed kernel packages:"
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        dpkg -l | grep -E "^ii\s+linux-image" | awk '{print "  " $2 " " $3}' || echo "  None found"
+    else
+        dpkg -l | grep -E "^ii\s+linux-image|^ii\s+linux-generic" | awk '{print "  " $2 " " $3}' || echo "  None found"
+    fi
+}
+
 validate_system() {
     show_header "System Validation"
     
@@ -271,6 +293,12 @@ validate_system() {
         else
             log_error "✗ $desc"
             ((errors++))
+            
+            # Show available kernels if kernel validation failed
+            if [[ "$func" == "validate_kernel_files" ]]; then
+                echo ""
+                list_available_kernels
+            fi
         fi
     done
     
@@ -506,22 +534,126 @@ validate_system_health() {
     return 0
 }
 
+check_and_fix_kernel_symlinks() {
+    log_info "Checking kernel symlinks..."
+    
+    # Check if we need to create symlinks
+    local need_vmlinuz_link=true
+    local need_initrd_link=true
+    
+    if [[ -L "/boot/vmlinuz" ]] || [[ -f "/boot/vmlinuz" ]]; then
+        need_vmlinuz_link=false
+    fi
+    
+    if [[ -L "/boot/initrd.img" ]] || [[ -f "/boot/initrd.img" ]]; then
+        need_initrd_link=false
+    fi
+    
+    if [[ "$need_vmlinuz_link" == "true" ]] || [[ "$need_initrd_link" == "true" ]]; then
+        log_info "Creating missing kernel symlinks..."
+        
+        # Find the latest kernel
+        local latest_kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
+        local latest_initrd=$(ls -1 /boot/initrd.img-* 2>/dev/null | sort -V | tail -1)
+        
+        if [[ -n "$latest_kernel" ]] && [[ "$need_vmlinuz_link" == "true" ]]; then
+            log_info "Creating symlink: /boot/vmlinuz -> $latest_kernel"
+            $SUDO ln -sf "$latest_kernel" /boot/vmlinuz
+        fi
+        
+        if [[ -n "$latest_initrd" ]] && [[ "$need_initrd_link" == "true" ]]; then
+            log_info "Creating symlink: /boot/initrd.img -> $latest_initrd"
+            $SUDO ln -sf "$latest_initrd" /boot/initrd.img
+        fi
+    fi
+}
+
 validate_kernel_files() {
     local kernel_version
     kernel_version=$(uname -r)
     
-    local required_files=(
+    # Try to fix common issues first
+    check_and_fix_kernel_symlinks
+    
+    # Check for kernel files with various naming patterns
+    local kernel_found=false
+    local initrd_found=false
+    
+    # Possible kernel locations and patterns
+    local kernel_patterns=(
         "/boot/vmlinuz-$kernel_version"
-        "/boot/initrd.img-$kernel_version"
+        "/boot/vmlinuz"
+        "/vmlinuz"
+        "/boot/vmlinuz-*-amd64"
+        "/boot/vmlinuz-*-generic"
+        "/boot/vmlinuz-*-kali*"
     )
     
-    for file in "${required_files[@]}"; do
-        if [[ ! -f "$file" ]]; then
-            log_error "Missing: $file"
-            return 1
+    local initrd_patterns=(
+        "/boot/initrd.img-$kernel_version"
+        "/boot/initrd.img"
+        "/initrd.img"
+        "/boot/initrd.img-*-amd64"
+        "/boot/initrd.img-*-generic"
+        "/boot/initrd.img-*-kali*"
+    )
+    
+    # Check for kernel
+    for pattern in "${kernel_patterns[@]}"; do
+        if [[ -f "$pattern" ]] || ls $pattern 2>/dev/null | head -1 >/dev/null; then
+            kernel_found=true
+            log_debug "Found kernel at: $pattern"
+            break
         fi
     done
     
+    # Check for initrd
+    for pattern in "${initrd_patterns[@]}"; do
+        if [[ -f "$pattern" ]] || ls $pattern 2>/dev/null | head -1 >/dev/null; then
+            initrd_found=true
+            log_debug "Found initrd at: $pattern"
+            break
+        fi
+    done
+    
+    if [[ "$kernel_found" == "false" ]]; then
+        log_error "No kernel image found. Tried patterns:"
+        for pattern in "${kernel_patterns[@]}"; do
+            log_error "  - $pattern"
+        done
+        echo ""
+        log_warning "Quick fix suggestions:"
+        if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+            log_info "1. Install Kali kernel:"
+            log_info "   sudo apt update"
+            log_info "   sudo apt install linux-image-amd64"
+            log_info ""
+            log_info "2. Create symlinks (if kernel exists elsewhere):"
+            log_info "   sudo ln -sf /boot/vmlinuz-\$(uname -r) /boot/vmlinuz"
+        else
+            log_info "1. Install generic kernel:"
+            log_info "   sudo apt update"
+            log_info "   sudo apt install linux-generic"
+        fi
+        return 1
+    fi
+    
+    if [[ "$initrd_found" == "false" ]]; then
+        log_error "No initrd image found. Tried patterns:"
+        for pattern in "${initrd_patterns[@]}"; do
+            log_error "  - $pattern"
+        done
+        echo ""
+        log_warning "Quick fix suggestions:"
+        log_info "1. Regenerate initrd:"
+        log_info "   sudo update-initramfs -c -k all"
+        log_info ""
+        log_info "2. Create symlinks (if initrd exists elsewhere):"
+        log_info "   sudo ln -sf /boot/initrd.img-\$(uname -r) /boot/initrd.img"
+        return 1
+    fi
+    
+    log_debug "Kernel validation passed"
     return 0
 }
 
@@ -1061,30 +1193,78 @@ copy_kernel_files() {
     local kernel_version
     kernel_version=$(uname -r)
     
-    # Copy kernel and initrd
-    for file in "vmlinuz" "initrd.img"; do
-        local source="/boot/$file-$kernel_version"
-        local dest="$CDROOT_DIR/live/$file"
+    # Function to find and copy kernel/initrd with various naming patterns
+    find_and_copy_kernel() {
+        local file_type="$1"  # "vmlinuz" or "initrd.img"
+        local dest="$CDROOT_DIR/live/$file_type"
         
-        if [[ -f "$source" ]]; then
-            $SUDO cp "$source" "$dest"
+        # Patterns to try in order of preference
+        local patterns=()
+        if [[ "$file_type" == "vmlinuz" ]]; then
+            patterns=(
+                "/boot/vmlinuz-$kernel_version"
+                "/boot/vmlinuz"
+                "/vmlinuz"
+                "/boot/vmlinuz-*-amd64"
+                "/boot/vmlinuz-*-generic"
+                "/boot/vmlinuz-*-kali*"
+            )
         else
-            # Try alternative locations for Kali
-            if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-                source="/boot/$file"
-                if [[ -f "$source" ]]; then
-                    $SUDO cp "$source" "$dest"
-                else
-                    log_error "Not found: $source or /boot/$file-$kernel_version"
-                    return 1
-                fi
-            else
-                log_error "Not found: $source"
-                return 1
-            fi
+            patterns=(
+                "/boot/initrd.img-$kernel_version"
+                "/boot/initrd.img"
+                "/initrd.img"
+                "/boot/initrd.img-*-amd64"
+                "/boot/initrd.img-*-generic"
+                "/boot/initrd.img-*-kali*"
+            )
         fi
-    done
+        
+        for pattern in "${patterns[@]}"; do
+            # Handle both direct files and glob patterns
+            if [[ -f "$pattern" ]]; then
+                log_debug "Copying $file_type from: $pattern"
+                $SUDO cp "$pattern" "$dest"
+                return 0
+            elif [[ "$pattern" == *"*"* ]]; then
+                # It's a glob pattern
+                local files=($(ls $pattern 2>/dev/null | sort -V | tail -1))
+                if [[ ${#files[@]} -gt 0 ]] && [[ -f "${files[0]}" ]]; then
+                    log_debug "Copying $file_type from: ${files[0]}"
+                    $SUDO cp "${files[0]}" "$dest"
+                    return 0
+                fi
+            fi
+        done
+        
+        log_error "Could not find $file_type to copy"
+        return 1
+    }
     
+    # Copy kernel
+    if ! find_and_copy_kernel "vmlinuz"; then
+        log_error "Failed to copy kernel"
+        log_info "Please ensure a kernel is installed:"
+        if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+            log_info "  sudo apt install linux-image-amd64"
+        else
+            log_info "  sudo apt install linux-generic"
+        fi
+        return 1
+    fi
+    
+    # Copy initrd
+    if ! find_and_copy_kernel "initrd.img"; then
+        log_error "Failed to copy initrd"
+        log_info "Try regenerating initrd:"
+        log_info "  sudo update-initramfs -c -k all"
+        return 1
+    fi
+    
+    # Make files readable
+    $SUDO chmod 644 "$CDROOT_DIR/live/vmlinuz" "$CDROOT_DIR/live/initrd.img"
+    
+    log_debug "Kernel files copied successfully"
     return 0
 }
 
@@ -1651,6 +1831,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
+            echo "Now with improved kernel detection and Kali Linux support!"
             exit 0
             ;;
         -q|--quiet)
