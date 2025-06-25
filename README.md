@@ -2,6 +2,8 @@
 
 AutoISO is a comprehensive bash script that creates persistent bootable Linux ISO images from your current system. It generates live USBs that can save changes between reboots, making it perfect for portable workstations, system recovery, or creating custom Linux distributions.
 
+Tested with a separate external 5TB HDD
+
 ## Features
 
 - **Persistent Live System**: Save changes between reboots
