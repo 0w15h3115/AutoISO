@@ -1034,4 +1034,177 @@ show_success_message() {
     echo "========================================="
     echo ""
     echo "📁 ISO Location: $iso_path"
-    echo "�
+    echo "📊 ISO Size: $iso_size"
+    echo "🔍 Checksums: $WORKDIR/checksums.txt"
+    echo "📋 Logs: $WORKDIR/logs/"
+    echo ""
+    echo "Next steps:"
+    echo "1. Test the ISO in a virtual machine"
+    echo "2. Write to USB: sudo dd if='$iso_path' of=/dev/sdX bs=4M status=progress"
+    echo "3. Or use a tool like Rufus, Etcher, or UNetbootin"
+    echo ""
+    echo "The ISO supports both BIOS and UEFI boot modes."
+    echo "========================================="
+    
+    # Cleanup temporary files but keep ISO and logs
+    SCRIPT_STATE[cleanup_required]="false"
+    cleanup_mounts_enhanced
+}
+
+# Enhanced main workflow
+main() {
+    # Setup
+    setup_logging
+    
+    # Check for resume capability
+    local resume_build=false
+    if check_resume_capability; then
+        resume_build=true
+    fi
+    
+    # Trap for cleanup
+    trap cleanup_all EXIT INT TERM
+    
+    if [[ "$resume_build" == "false" ]]; then
+        # Full validation for new builds
+        if ! validate_system; then
+            fatal_error "System validation failed"
+        fi
+        
+        # Clean workspace
+        log_info "Preparing clean workspace..."
+        $SUDO rm -rf "$WORKDIR"
+        mkdir -p "$EXTRACT_DIR" "$CDROOT_DIR/boot/isolinux" "$CDROOT_DIR/live"
+        save_state "workspace_prepared"
+    fi
+    
+    # Execute stages based on current state
+    case "${SCRIPT_STATE[stage]}" in
+        "init"|"workspace_prepared")
+            atomic_operation "system_copy" enhanced_rsync || fatal_error "System copy failed"
+            ;&  # Fall through
+        "atomic_system_copy_complete")
+            atomic_operation "post_copy_cleanup" post_copy_cleanup || fatal_error "Post-copy cleanup failed"
+            ;&
+        "atomic_post_copy_cleanup_complete")
+            atomic_operation "chroot_config" configure_chroot_enhanced || fatal_error "Chroot configuration failed"
+            ;&
+        "atomic_chroot_config_complete")
+            atomic_operation "squashfs_creation" create_squashfs_enhanced || fatal_error "SquashFS creation failed"
+            ;&
+        "atomic_squashfs_creation_complete")
+            atomic_operation "bootloader_setup" setup_bootloader_enhanced || fatal_error "Bootloader setup failed"
+            ;&
+        "atomic_bootloader_setup_complete")
+            atomic_operation "iso_creation" create_iso_enhanced || fatal_error "ISO creation failed"
+            ;&
+        "atomic_iso_creation_complete")
+            log_info "Build completed successfully!"
+            show_success_message
+            ;;
+        *)
+            log_error "Unknown state: ${SCRIPT_STATE[stage]}"
+            fatal_error "Invalid build state"
+            ;;
+    esac
+}
+
+# Help and usage information
+show_usage() {
+    echo "Enhanced AutoISO v$SCRIPT_VERSION - Reliable Live ISO Creator"
+    echo ""
+    echo "Usage: $0 [WORK_DIRECTORY]"
+    echo ""
+    echo "Arguments:"
+    echo "  WORK_DIRECTORY    Directory for build files (default: /tmp/autoiso-build)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                                # Use /tmp/autoiso-build"
+    echo "  $0 /home/user/iso-build          # Use custom directory"
+    echo "  $0 /mnt/external/iso-build       # Use external drive"
+    echo ""
+    echo "Features:"
+    echo "  ✓ Comprehensive system validation"
+    echo "  ✓ Resume capability after interruption"
+    echo "  ✓ Enhanced error handling and recovery"
+    echo "  ✓ Atomic operations with rollback"
+    echo "  ✓ Detailed logging and progress tracking"
+    echo "  ✓ BIOS and UEFI boot support"
+    echo "  ✓ Optimized compression and file handling"
+    echo ""
+    echo "Requirements:"
+    echo "  - Ubuntu/Debian-based system"
+    echo "  - squashfs-tools, xorriso, genisoimage, rsync"
+    echo "  - At least ${MIN_SPACE_GB}GB free space"
+    echo "  - Root or sudo access"
+    echo ""
+}
+
+# Command line argument processing
+process_arguments() {
+    case "${1:-}" in
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "Enhanced AutoISO v$SCRIPT_VERSION"
+            exit 0
+            ;;
+        "")
+            # No arguments - use default
+            ;;
+        *)
+            if [[ "$1" =~ ^- ]]; then
+                echo "Error: Unknown option '$1'"
+                echo "Use '$0 --help' for usage information."
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# Initialize if run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    # Process command line arguments
+    process_arguments "$@"
+    
+    # Configuration setup
+    if [ -n "${1:-}" ] && [[ ! "$1" =~ ^- ]]; then
+        WORKDIR="$1/autoiso-build"
+    elif [ -n "${WORKDIR:-}" ]; then
+        WORKDIR="${WORKDIR}/autoiso-build"
+    else
+        WORKDIR="/tmp/autoiso-build"
+    fi
+    
+    # Resolve absolute path
+    WORKDIR=$(realpath "$WORKDIR" 2>/dev/null || echo "$WORKDIR")
+    EXTRACT_DIR="$WORKDIR/extract"
+    CDROOT_DIR="$WORKDIR/cdroot"
+    STATE_FILE="$WORKDIR/.autoiso-state"
+    
+    # Sudo detection
+    if [ "$EUID" -eq 0 ]; then
+        SUDO=""
+    else
+        SUDO="sudo"
+        # Test sudo access
+        if ! $SUDO -n true 2>/dev/null; then
+            echo "This script requires sudo access. You may be prompted for your password."
+            $SUDO true || {
+                echo "Error: Cannot obtain sudo access"
+                exit 1
+            }
+        fi
+    fi
+    
+    # Display startup information
+    echo "Enhanced AutoISO v$SCRIPT_VERSION"
+    echo "Work directory: $WORKDIR"
+    echo "Starting build process..."
+    echo ""
+    
+    # Start main process
+    main "$@"
+fi
