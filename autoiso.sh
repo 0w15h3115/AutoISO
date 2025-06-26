@@ -1,5 +1,5 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.1 - Professional Live ISO Creator with Kali Linux Support
+# Enhanced AutoISO v3.1.2 - Professional Live ISO Creator with Kali Linux Support
 # Optimized for reliability, performance, and user experience
 
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.1"
+readonly SCRIPT_VERSION="3.1.2"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -379,6 +379,13 @@ validate_space_detailed() {
     # Calculate system size using multiple methods
     local system_size_kb
     system_size_kb=$(calculate_system_size_smart)
+    
+    # Validate the size is a number
+    if [[ ! "$system_size_kb" =~ ^[0-9]+$ ]]; then
+        log_warning "Could not accurately calculate system size, using default estimate"
+        system_size_kb=$((15 * 1024 * 1024))  # 15GB default
+    fi
+    
     local system_size_gb=$((system_size_kb / 1024 / 1024))
     
     # Kali typically needs more space
@@ -411,6 +418,12 @@ validate_space_detailed() {
     # Check available space
     local available_space_gb
     available_space_gb=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}' || echo "0")
+    
+    # Validate available space is a number
+    if [[ ! "$available_space_gb" =~ ^[0-9]+$ ]]; then
+        log_error "Could not determine available disk space"
+        return 1
+    fi
     
     log_info "Available space: ${available_space_gb}GB"
     
@@ -467,16 +480,37 @@ calculate_size_du() {
         exclude_args+=(--exclude="$pattern")
     done
     
-    timeout 60 du -sk "${exclude_args[@]}" / 2>/dev/null | cut -f1
+    local size_output
+    size_output=$(timeout 60 du -sk "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
+    
+    # Ensure we have a valid number
+    if [[ ! "$size_output" =~ ^[0-9]+$ ]]; then
+        echo "0"
+    else
+        echo "$size_output"
+    fi
 }
 
 calculate_size_df() {
     local used_kb
-    used_kb=$(df / | awk 'NR==2 {print $3}')
+    used_kb=$(df / | awk 'NR==2 {print $3}' || echo "0")
+    
+    # Ensure we have a valid number
+    if [[ ! "$used_kb" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return 1
+    fi
     
     # Subtract estimated cache/temp size
     local cache_size_kb=$((2 * 1024 * 1024))  # 2GB estimate
-    echo $((used_kb - cache_size_kb))
+    local result=$((used_kb - cache_size_kb))
+    
+    # Ensure result is not negative
+    if [[ $result -lt 0 ]]; then
+        echo "$used_kb"
+    else
+        echo "$result"
+    fi
 }
 
 suggest_space_solutions_enhanced() {
@@ -673,8 +707,18 @@ enhanced_rsync() {
     local total_size_bytes
     local total_size_human
     
-    # Get estimated size (this is fast)
-    total_size_bytes=$(df / | awk 'NR==2 {print $3 * 1024}')
+    # Get estimated size (this is fast) - ensure we get a valid number
+    local df_output
+    df_output=$(df / | awk 'NR==2 {print $3}' || echo "0")
+    
+    # Validate it's a number
+    if [[ "$df_output" =~ ^[0-9]+$ ]]; then
+        total_size_bytes=$((df_output * 1024))
+    else
+        # Fallback to a reasonable estimate
+        total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB in bytes
+    fi
+    
     total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
     
     log_info "Estimated data to copy: $total_size_human"
@@ -1069,12 +1113,28 @@ create_squashfs_enhanced() {
     # Get source size for estimation
     log_info "Analyzing source data..."
     local source_size_bytes
-    source_size_bytes=$(du -sb "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "0")
+    local du_output
+    du_output=$(du -sb "$EXTRACT_DIR" 2>/dev/null | cut -f1)
+    
+    # Validate it's a number
+    if [[ "$du_output" =~ ^[0-9]+$ ]]; then
+        source_size_bytes="$du_output"
+    else
+        source_size_bytes="0"
+    fi
+    
     local source_size_human
-    source_size_human=$(numfmt --to=iec-i --suffix=B "$source_size_bytes" 2>/dev/null || echo "N/A")
+    if [[ "$source_size_bytes" != "0" ]]; then
+        source_size_human=$(numfmt --to=iec-i --suffix=B "$source_size_bytes" 2>/dev/null || echo "N/A")
+    else
+        source_size_human="N/A"
+    fi
     
     # Estimate compressed size (typically 40-50% of original)
-    local estimated_compressed=$((source_size_bytes / 1024 / 1024 / 2))
+    local estimated_compressed=0
+    if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$source_size_bytes" -gt 0 ]]; then
+        estimated_compressed=$((source_size_bytes / 1024 / 1024 / 2))
+    fi
     
     log_info "Source size: $source_size_human"
     log_info "Estimated compressed size: ~${estimated_compressed}MB"
@@ -1139,12 +1199,26 @@ create_squashfs_enhanced() {
     if [[ $squashfs_status -eq 0 ]]; then
         # Get final size and compression ratio
         local final_size_bytes
-        final_size_bytes=$(stat -c%s "$squashfs_file" 2>/dev/null || echo "0")
+        local stat_output
+        stat_output=$(stat -c%s "$squashfs_file" 2>/dev/null)
+        
+        # Validate it's a number
+        if [[ "$stat_output" =~ ^[0-9]+$ ]]; then
+            final_size_bytes="$stat_output"
+        else
+            final_size_bytes="0"
+        fi
+        
         local final_size_human
-        final_size_human=$(numfmt --to=iec-i --suffix=B "$final_size_bytes" 2>/dev/null || echo "N/A")
+        if [[ "$final_size_bytes" != "0" ]]; then
+            final_size_human=$(numfmt --to=iec-i --suffix=B "$final_size_bytes" 2>/dev/null || echo "N/A")
+        else
+            final_size_human="N/A"
+        fi
         
         local compression_ratio="N/A"
-        if [[ $source_size_bytes -gt 0 && $final_size_bytes -gt 0 ]]; then
+        if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$final_size_bytes" =~ ^[0-9]+$ ]] && 
+           [[ "$source_size_bytes" -gt 0 ]] && [[ "$final_size_bytes" -gt 0 ]]; then
             compression_ratio=$(awk "BEGIN {printf \"%.1f:1\", $source_size_bytes / $final_size_bytes}")
         fi
         
@@ -1155,7 +1229,13 @@ create_squashfs_enhanced() {
         echo -e "  ${CYAN}Original size:${NC}      $source_size_human"
         echo -e "  ${CYAN}Compressed size:${NC}    $final_size_human"
         echo -e "  ${CYAN}Compression ratio:${NC}  $compression_ratio"
-        echo -e "  ${CYAN}Space saved:${NC}        $(numfmt --to=iec-i --suffix=B $((source_size_bytes - final_size_bytes)) 2>/dev/null || echo 'N/A')"
+        
+        if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$final_size_bytes" =~ ^[0-9]+$ ]] && 
+           [[ "$source_size_bytes" -gt "$final_size_bytes" ]]; then
+            echo -e "  ${CYAN}Space saved:${NC}        $(numfmt --to=iec-i --suffix=B $((source_size_bytes - final_size_bytes)) 2>/dev/null || echo 'N/A')"
+        else
+            echo -e "  ${CYAN}Space saved:${NC}        N/A"
+        fi
         
         return 0
     else
@@ -1414,8 +1494,15 @@ EOF
 
 create_iso_metadata() {
     # Create filesystem.size
-    echo "$(du -sx --block-size=1 "$EXTRACT_DIR" | cut -f1)" | \
-        $SUDO tee "$CDROOT_DIR/live/filesystem.size" >/dev/null
+    local fs_size
+    fs_size=$(du -sx --block-size=1 "$EXTRACT_DIR" 2>/dev/null | cut -f1)
+    
+    # Validate it's a number
+    if [[ ! "$fs_size" =~ ^[0-9]+$ ]]; then
+        fs_size="0"
+    fi
+    
+    echo "$fs_size" | $SUDO tee "$CDROOT_DIR/live/filesystem.size" >/dev/null
     
     # Create manifest
     $SUDO chroot "$EXTRACT_DIR" dpkg-query -W --showformat='${Package} ${Version}\n' | \
@@ -1459,9 +1546,22 @@ create_iso_enhanced() {
     # Calculate expected ISO size
     log_info "Calculating ISO size..."
     local cdroot_size_bytes
-    cdroot_size_bytes=$(du -sb "$CDROOT_DIR" 2>/dev/null | cut -f1 || echo "0")
+    local du_output
+    du_output=$(du -sb "$CDROOT_DIR" 2>/dev/null | cut -f1)
+    
+    # Validate it's a number
+    if [[ "$du_output" =~ ^[0-9]+$ ]]; then
+        cdroot_size_bytes="$du_output"
+    else
+        cdroot_size_bytes="0"
+    fi
+    
     local cdroot_size_human
-    cdroot_size_human=$(numfmt --to=iec-i --suffix=B "$cdroot_size_bytes" 2>/dev/null || echo "N/A")
+    if [[ "$cdroot_size_bytes" != "0" ]]; then
+        cdroot_size_human=$(numfmt --to=iec-i --suffix=B "$cdroot_size_bytes" 2>/dev/null || echo "N/A")
+    else
+        cdroot_size_human="N/A"
+    fi
     
     log_info "ISO content size: $cdroot_size_human"
     echo ""
@@ -1597,9 +1697,22 @@ create_iso_enhanced() {
     
     # Get final ISO stats
     local iso_size_bytes
-    iso_size_bytes=$(stat -c%s "$iso_file" 2>/dev/null || echo "0")
+    local stat_output
+    stat_output=$(stat -c%s "$iso_file" 2>/dev/null)
+    
+    # Validate it's a number
+    if [[ "$stat_output" =~ ^[0-9]+$ ]]; then
+        iso_size_bytes="$stat_output"
+    else
+        iso_size_bytes="0"
+    fi
+    
     local iso_size_human
-    iso_size_human=$(numfmt --to=iec-i --suffix=B "$iso_size_bytes" 2>/dev/null || echo "N/A")
+    if [[ "$iso_size_bytes" != "0" ]]; then
+        iso_size_human=$(numfmt --to=iec-i --suffix=B "$iso_size_bytes" 2>/dev/null || echo "N/A")
+    else
+        iso_size_human="N/A"
+    fi
     
     # Save ISO path
     echo "$iso_file" > "$WORKDIR/.final_iso_path"
@@ -1658,6 +1771,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
+    echo -e "${GREEN}Now with improved error handling and number validation${NC}"
     echo ""
 }
 
