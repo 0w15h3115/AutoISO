@@ -1,6 +1,7 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.2 - Professional Live ISO Creator with Kali Linux Support
+# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Kali Linux Support
 # Optimized for reliability, performance, and user experience
+# Now with comprehensive help system and enhanced flags
 
 set -euo pipefail
 
@@ -9,7 +10,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.2"
+readonly SCRIPT_VERSION="3.1.3"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -39,6 +40,582 @@ declare -A PROGRESS_CHARS=(
     [0]="⠋" [1]="⠙" [2]="⠹" [3]="⠸" [4]="⠼" [5]="⠴" [6]="⠦" [7]="⠧" [8]="⠇" [9]="⠏"
 )
 PROGRESS_INDEX=0
+
+# Help topics array
+declare -A HELP_TOPICS=(
+    [usage]="Show basic usage information"
+    [examples]="Show practical examples"
+    [distributions]="Show supported distributions"
+    [troubleshooting]="Show troubleshooting guide"
+    [requirements]="Show system requirements"
+    [space]="Show disk space information"
+    [kernels]="Show kernel requirements"
+    [bootmodes]="Show boot mode information"
+    [persistence]="Show persistence setup guide"
+    [kali]="Show Kali Linux specific information"
+    [flags]="Show all available flags"
+)
+
+# ========================================
+#    ENHANCED HELP SYSTEM
+# ========================================
+
+show_help_menu() {
+    echo -e "${BOLD}${BLUE}AutoISO Enhanced Help System${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "Available help topics:"
+    echo ""
+    
+    for topic in "${!HELP_TOPICS[@]}"; do
+        printf "  ${GREEN}%-15s${NC} %s\n" "$topic" "${HELP_TOPICS[$topic]}"
+    done
+    
+    echo ""
+    echo "Usage: $0 --help [TOPIC]"
+    echo "Example: $0 --help kali"
+    echo ""
+}
+
+show_help_usage() {
+    echo -e "${BOLD}AutoISO Usage Guide${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "SYNOPSIS:"
+    echo "    $0 [OPTIONS] [WORK_DIRECTORY]"
+    echo ""
+    echo "DESCRIPTION:"
+    echo "    AutoISO creates persistent bootable Linux ISO images from your current"
+    echo "    running system. Perfect for creating portable workstations, system"
+    echo "    recovery disks, or custom Linux distributions."
+    echo ""
+    echo "OPTIONS:"
+    echo "    -h, --help [TOPIC]    Show help (optionally for specific topic)"
+    echo "    -v, --version         Show version information"
+    echo "    -q, --quiet           Minimal output mode"
+    echo "    -d, --debug           Enable detailed debug output"
+    echo "    --check-only          Only validate system without building"
+    echo "    --resume              Try to resume previous build"
+    echo "    --clean               Clean workspace before starting"
+    echo ""
+    echo "ARGUMENTS:"
+    echo "    WORK_DIRECTORY        Directory for build files"
+    echo "                         Default: $DEFAULT_WORKDIR"
+    echo ""
+    echo "For more specific help, use: $0 --help [TOPIC]"
+    echo "Available topics: ${!HELP_TOPICS[*]}"
+}
+
+show_help_examples() {
+    echo -e "${BOLD}AutoISO Examples${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Basic Usage:${NC}"
+    echo "    # Use default settings"
+    echo "    $0"
+    echo ""
+    echo "    # Use custom build directory"
+    echo "    $0 /home/user/iso-build"
+    echo ""
+    echo -e "${YELLOW}External Storage:${NC}"
+    echo "    # Use USB drive for build"
+    echo "    $0 /media/user/USB-DRIVE"
+    echo ""
+    echo "    # Use external SSD"
+    echo "    $0 /mnt/external-ssd"
+    echo ""
+    echo "    # Use network storage"
+    echo "    $0 /mnt/nas/iso-build"
+    echo ""
+    echo -e "${YELLOW}Advanced Options:${NC}"
+    echo "    # Quiet mode for scripting"
+    echo "    $0 -q /tmp/iso-build"
+    echo ""
+    echo "    # Debug mode for troubleshooting"
+    echo "    $0 -d /home/user/debug-build"
+    echo ""
+    echo "    # Check system only (no build)"
+    echo "    $0 --check-only"
+    echo ""
+    echo -e "${YELLOW}Resume and Clean:${NC}"
+    echo "    # Resume interrupted build"
+    echo "    $0 --resume /same/directory/as/before"
+    echo ""
+    echo "    # Clean start (remove previous files)"
+    echo "    $0 --clean /build/directory"
+}
+
+show_help_distributions() {
+    echo -e "${BOLD}Supported Linux Distributions${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${GREEN}✓ Fully Supported:${NC}"
+    echo "    • Ubuntu (all official flavors)"
+    echo "      - Ubuntu Desktop/Server"
+    echo "      - Kubuntu, Xubuntu, Lubuntu"
+    echo "      - Ubuntu MATE, Ubuntu Budgie"
+    echo ""
+    echo "    • Debian (all releases)"
+    echo "      - Stable, Testing, Unstable"
+    echo "      - All desktop environments"
+    echo ""
+    echo "    • Kali Linux"
+    echo "      - Full tool support"
+    echo "      - Forensic mode"
+    echo "      - Encrypted persistence"
+    echo ""
+    echo "    • Popular Derivatives"
+    echo "      - Linux Mint"
+    echo "      - Pop!_OS"
+    echo "      - Elementary OS"
+    echo "      - Zorin OS"
+    echo ""
+    echo -e "${YELLOW}⚠ Experimental:${NC}"
+    echo "    • Parrot OS"
+    echo "    • Other Debian-based distros"
+    echo ""
+    echo -e "${RED}✗ Not Supported:${NC}"
+    echo "    • RPM-based distributions (Fedora, CentOS, RHEL)"
+    echo "    • Arch-based distributions"
+    echo "    • Other package managers (pacman, yum, zypper)"
+    echo ""
+    echo "Detection is automatic - the script will identify your distribution"
+    echo "and apply appropriate configurations."
+}
+
+show_help_troubleshooting() {
+    echo -e "${BOLD}AutoISO Troubleshooting Guide${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Common Issues and Solutions:${NC}"
+    echo ""
+    echo -e "${RED}1. \"Insufficient space\" error:${NC}"
+    echo "   Solutions:"
+    echo "   • Use external drive: $0 /media/usb/"
+    echo "   • Clean system: sudo apt autoremove && sudo apt autoclean"
+    echo "   • Check space: df -h"
+    echo "   • Remove old kernels: sudo apt autoremove --purge"
+    echo ""
+    echo -e "${RED}2. \"Kernel not found\" error:${NC}"
+    echo "   Solutions:"
+    echo "   • Install kernel: sudo apt install linux-generic"
+    echo "   • For Kali: sudo apt install linux-image-amd64"
+    echo "   • Update initramfs: sudo update-initramfs -c -k all"
+    echo "   • Check kernels: ls -la /boot/vmlinuz*"
+    echo ""
+    echo -e "${RED}3. \"Package manager locked\" error:${NC}"
+    echo "   Solutions:"
+    echo "   • Wait for other apt processes to finish"
+    echo "   • Kill stuck processes: sudo killall apt apt-get"
+    echo "   • Remove locks: sudo rm /var/lib/dpkg/lock*"
+    echo "   • Fix broken packages: sudo dpkg --configure -a"
+    echo ""
+    echo -e "${RED}4. \"USB not booting\" issue:${NC}"
+    echo "   Solutions:"
+    echo "   • Verify ISO: md5sum your-iso-file.iso"
+    echo "   • Try different USB port/drive"
+    echo "   • Check BIOS boot order"
+    echo "   • Disable Secure Boot for older hardware"
+    echo "   • Use different write method (Rufus, Etcher)"
+    echo ""
+    echo -e "${RED}5. \"Build fails during rsync\" error:${NC}"
+    echo "   Solutions:"
+    echo "   • Check disk space during build"
+    echo "   • Ensure no files are in use"
+    echo "   • Close applications accessing system files"
+    echo "   • Try with --debug flag for more info"
+    echo ""
+    echo -e "${YELLOW}For more help:${NC}"
+    echo "   • Check logs in: \$WORKDIR/logs/"
+    echo "   • Use debug mode: $0 --debug"
+    echo "   • Run system check: $0 --check-only"
+}
+
+show_help_requirements() {
+    echo -e "${BOLD}System Requirements${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Operating System:${NC}"
+    echo "   • Debian-based Linux distribution"
+    echo "   • Ubuntu 16.04+ (recommended 20.04+)"
+    echo "   • Debian 9+ (recommended 11+)"
+    echo "   • Kali Linux (any recent version)"
+    echo ""
+    echo -e "${YELLOW}Hardware Requirements:${NC}"
+    echo "   • Architecture: x86_64 (64-bit)"
+    echo "   • RAM: 4GB minimum, 8GB+ recommended"
+    echo "   • CPU: Any modern processor (multiple cores help)"
+    echo ""
+    echo -e "${YELLOW}Storage Requirements:${NC}"
+    echo "   • Free space: 15GB minimum"
+    echo "   • Recommended: 25GB+ for comfortable building"
+    echo "   • Kali Linux: 20GB minimum, 30GB recommended"
+    echo "   • External storage: USB 3.0+ for better performance"
+    echo ""
+    echo -e "${YELLOW}Software Dependencies:${NC}"
+    echo "   Required packages (auto-installed):"
+    echo "   • rsync - for system copying"
+    echo "   • squashfs-tools - for filesystem compression"
+    echo "   • xorriso - for ISO creation"
+    echo "   • genisoimage - for ISO utilities"
+    echo "   • isolinux - for boot loader"
+    echo ""
+    echo -e "${YELLOW}Permissions:${NC}"
+    echo "   • Root or sudo access required"
+    echo "   • Write access to build directory"
+    echo "   • Access to /boot, /lib, /usr directories"
+    echo ""
+    echo -e "${YELLOW}Network:${NC}"
+    echo "   • Internet connection for package installation"
+    echo "   • May download 50-200MB of dependencies"
+}
+
+show_help_space() {
+    echo -e "${BOLD}Disk Space Management${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Space Calculation:${NC}"
+    echo "   The script analyzes your system and calculates:"
+    echo "   • System copy size (original files)"
+    echo "   • SquashFS compressed size (~50% of original)"
+    echo "   • Working space for temporary files"
+    echo "   • Safety margin for operations"
+    echo ""
+    echo -e "${YELLOW}Typical Space Requirements:${NC}"
+    echo "   • Ubuntu Desktop: 15-20GB"
+    echo "   • Ubuntu Server: 8-12GB"
+    echo "   • Debian Desktop: 12-18GB"
+    echo "   • Kali Linux: 20-30GB"
+    echo "   • Minimal systems: 8-10GB"
+    echo ""
+    echo -e "${YELLOW}Space Optimization Tips:${NC}"
+    echo "   Before building:"
+    echo "   • Clean package cache: sudo apt autoclean"
+    echo "   • Remove old kernels: sudo apt autoremove"
+    echo "   • Clean logs: sudo journalctl --vacuum-time=1d"
+    echo "   • Remove unnecessary packages"
+    echo ""
+    echo -e "${YELLOW}External Storage Options:${NC}"
+    echo "   • USB 3.0+ drives (good performance)"
+    echo "   • External SSDs (best performance)"
+    echo "   • Network storage (NFS, CIFS)"
+    echo "   • Secondary internal drives"
+    echo ""
+    echo -e "${YELLOW}Build Directory Structure:${NC}"
+    echo "   your-build-dir/"
+    echo "   ├── extract/          # System copy (~8-15GB)"
+    echo "   ├── cdroot/           # ISO structure (~4-8GB)"
+    echo "   │   └── live/"
+    echo "   │       └── filesystem.squashfs"
+    echo "   ├── logs/             # Build logs"
+    echo "   └── your-iso-file.iso # Final ISO (~2-6GB)"
+}
+
+show_help_kernels() {
+    echo -e "${BOLD}Kernel Requirements${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Required Kernel Files:${NC}"
+    echo "   • vmlinuz (kernel image)"
+    echo "   • initrd.img (initial ramdisk)"
+    echo "   • Both must match your running kernel version"
+    echo ""
+    echo -e "${YELLOW}Common Kernel Locations:${NC}"
+    echo "   • /boot/vmlinuz-\$(uname -r)"
+    echo "   • /boot/initrd.img-\$(uname -r)"
+    echo "   • /boot/vmlinuz (symlink)"
+    echo "   • /boot/initrd.img (symlink)"
+    echo ""
+    echo -e "${YELLOW}Installing Missing Kernels:${NC}"
+    echo "   Ubuntu/Debian:"
+    echo "   sudo apt update"
+    echo "   sudo apt install linux-generic"
+    echo ""
+    echo "   Kali Linux:"
+    echo "   sudo apt update"
+    echo "   sudo apt install linux-image-amd64"
+    echo ""
+    echo -e "${YELLOW}Fixing Kernel Issues:${NC}"
+    echo "   • Regenerate initrd:"
+    echo "     sudo update-initramfs -c -k all"
+    echo ""
+    echo "   • Create missing symlinks:"
+    echo "     sudo ln -sf /boot/vmlinuz-\$(uname -r) /boot/vmlinuz"
+    echo "     sudo ln -sf /boot/initrd.img-\$(uname -r) /boot/initrd.img"
+    echo ""
+    echo "   • List available kernels:"
+    echo "     ls -la /boot/vmlinuz*"
+    echo "     dpkg -l | grep linux-image"
+    echo ""
+    echo -e "${YELLOW}Kernel Compatibility:${NC}"
+    echo "   • Use the currently running kernel"
+    echo "   • Version shown by: uname -r"
+    echo "   • Must have matching initrd"
+    echo "   • Generic kernels work best for live systems"
+}
+
+show_help_bootmodes() {
+    echo -e "${BOLD}Boot Modes and Options${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}BIOS vs UEFI:${NC}"
+    echo "   • BIOS: Legacy boot mode (older systems)"
+    echo "   • UEFI: Modern boot mode (newer systems)"
+    echo "   • AutoISO creates hybrid ISOs supporting both"
+    echo ""
+    echo -e "${YELLOW}Ubuntu/Debian Boot Options:${NC}"
+    echo "   • Live Mode: Standard live environment"
+    echo "   • Persistent Mode: Saves changes between reboots"
+    echo "   • Safe Mode: Uses basic graphics drivers"
+    echo "   • To RAM: Loads entire system to memory"
+    echo ""
+    echo -e "${YELLOW}Kali Linux Boot Options:${NC}"
+    echo "   • Live (amd64): Standard live mode"
+    echo "   • Forensic Mode: No swap, no automount"
+    echo "   • Live USB Persistence: Saves changes"
+    echo "   • Encrypted Persistence: LUKS-encrypted storage"
+    echo ""
+    echo -e "${YELLOW}Boot Parameters:${NC}"
+    echo "   Common kernel parameters you can add:"
+    echo "   • nomodeset: Fix graphics issues"
+    echo "   • acpi=off: Disable ACPI (old hardware)"
+    echo "   • noapic: Disable APIC (compatibility)"
+    echo "   • persistent: Enable persistence"
+    echo "   • toram: Load to RAM"
+    echo ""
+    echo -e "${YELLOW}Creating Bootable USB:${NC}"
+    echo "   Linux:"
+    echo "   sudo dd if=your-iso.iso of=/dev/sdX bs=4M status=progress"
+    echo ""
+    echo "   Windows:"
+    echo "   • Use Rufus (recommended)"
+    echo "   • Use Etcher"
+    echo ""
+    echo "   Cross-platform:"
+    echo "   • Ventoy (supports multiple ISOs)"
+}
+
+show_help_persistence() {
+    echo -e "${BOLD}Persistence Setup Guide${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}What is Persistence?${NC}"
+    echo "   Persistence allows your live USB to save:"
+    echo "   • User files and documents"
+    echo "   • Installed software"
+    echo "   • System settings and configurations"
+    echo "   • User accounts and passwords"
+    echo ""
+    echo -e "${YELLOW}Setting Up Persistence:${NC}"
+    echo ""
+    echo "   1. Create bootable USB normally:"
+    echo "      sudo dd if=your-iso.iso of=/dev/sdX bs=4M"
+    echo ""
+    echo "   2. Create persistence partition:"
+    echo "      sudo fdisk /dev/sdX"
+    echo "      # Create new partition using remaining space"
+    echo ""
+    echo "   3. Format persistence partition:"
+    echo "      sudo mkfs.ext4 -L persistence /dev/sdX2"
+    echo ""
+    echo "   4. Configure persistence:"
+    echo "      sudo mkdir -p /mnt/persistence"
+    echo "      sudo mount /dev/sdX2 /mnt/persistence"
+    echo "      echo '/ union' | sudo tee /mnt/persistence/persistence.conf"
+    echo "      sudo umount /mnt/persistence"
+    echo ""
+    echo -e "${YELLOW}Encrypted Persistence (Kali):${NC}"
+    echo "   1. Create LUKS partition:"
+    echo "      sudo cryptsetup --verbose --verify-passphrase luksFormat /dev/sdX2"
+    echo ""
+    echo "   2. Open encrypted partition:"
+    echo "      sudo cryptsetup luksOpen /dev/sdX2 my_usb"
+    echo ""
+    echo "   3. Format and configure:"
+    echo "      sudo mkfs.ext4 -L persistence /dev/mapper/my_usb"
+    echo "      sudo mkdir -p /mnt/my_usb"
+    echo "      sudo mount /dev/mapper/my_usb /mnt/my_usb"
+    echo "      echo '/ union' | sudo tee /mnt/my_usb/persistence.conf"
+    echo "      sudo umount /dev/mapper/my_usb"
+    echo "      sudo cryptsetup luksClose /dev/mapper/my_usb"
+    echo ""
+    echo -e "${YELLOW}GUI Tools:${NC}"
+    echo "   • GParted: For partition management"
+    echo "   • GNOME Disks: Simple partition tool"
+    echo "   • KDE Partition Manager: KDE environment"
+    echo ""
+    echo -e "${YELLOW}Troubleshooting Persistence:${NC}"
+    echo "   • Ensure partition is labeled 'persistence'"
+    echo "   • Check persistence.conf contains '/ union'"
+    echo "   • Use persistence boot option"
+    echo "   • Verify partition filesystem is ext4"
+}
+
+show_help_kali() {
+    echo -e "${BOLD}Kali Linux Specific Information${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Kali Linux Features:${NC}"
+    echo "   • Full penetration testing toolkit"
+    echo "   • Forensic mode for investigation work"
+    echo "   • Encrypted persistence support"
+    echo "   • Specialized boot options"
+    echo "   • Pre-configured security tools"
+    echo ""
+    echo -e "${YELLOW}Default Credentials:${NC}"
+    echo "   • Username: kali"
+    echo "   • Password: kali"
+    echo "   • User has sudo privileges"
+    echo ""
+    echo -e "${YELLOW}Kali-Specific Build Requirements:${NC}"
+    echo "   • Minimum 20GB free space (25GB recommended)"
+    echo "   • linux-image-amd64 package"
+    echo "   • live-boot and live-config packages"
+    echo "   • Longer build time due to size"
+    echo ""
+    echo -e "${YELLOW}Boot Modes:${NC}"
+    echo "   • Live (amd64): Standard operation"
+    echo "   • Forensic Mode: Read-only, no modifications"
+    echo "     - No swap usage"
+    echo "     - No automatic mounting"
+    echo "     - Safe for forensic investigation"
+    echo "   • Persistence: Save changes"
+    echo "   • Encrypted Persistence: LUKS encryption"
+    echo ""
+    echo -e "${YELLOW}Tool Categories Included:${NC}"
+    echo "   • Information Gathering"
+    echo "   • Vulnerability Analysis"
+    echo "   • Web Application Analysis"
+    echo "   • Database Assessment"
+    echo "   • Password Attacks"
+    echo "   • Wireless Attacks"
+    echo "   • Reverse Engineering"
+    echo "   • Exploitation Tools"
+    echo "   • Forensics Tools"
+    echo "   • Stress Testing"
+    echo ""
+    echo -e "${YELLOW}Post-Build Recommendations:${NC}"
+    echo "   • Update tools: sudo apt update && sudo apt full-upgrade"
+    echo "   • Configure SSH keys for penetration testing"
+    echo "   • Set up VPN configurations"
+    echo "   • Configure wireless adapters"
+    echo "   • Test tools in virtual environment first"
+    echo ""
+    echo -e "${YELLOW}Space Optimization for Kali:${NC}"
+    echo "   Remove unnecessary tool groups before building:"
+    echo "   sudo apt remove kali-tools-gpu      # GPU tools"
+    echo "   sudo apt remove kali-tools-hardware # Hardware tools"
+    echo "   sudo apt remove kali-tools-sdr      # Software Defined Radio"
+    echo ""
+    echo -e "${RED}Legal and Ethical Notice:${NC}"
+    echo "   • Use Kali Linux responsibly"
+    echo "   • Only test systems you own or have permission to test"
+    echo "   • Follow all applicable laws and regulations"
+    echo "   • Respect privacy and data protection"
+}
+
+show_help_flags() {
+    echo -e "${BOLD}Complete Flag Reference${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${YELLOW}Information Flags:${NC}"
+    echo "   -h, --help [TOPIC]    Show help information"
+    echo "                         Topics: usage, examples, distributions,"
+    echo "                         troubleshooting, requirements, space,"
+    echo "                         kernels, bootmodes, persistence, kali, flags"
+    echo ""
+    echo "   -v, --version         Show version information and exit"
+    echo ""
+    echo -e "${YELLOW}Behavior Flags:${NC}"
+    echo "   -q, --quiet           Minimal output mode"
+    echo "                         • Reduces progress messages"
+    echo "                         • Useful for scripting"
+    echo "                         • Errors still shown"
+    echo ""
+    echo "   -d, --debug           Enable detailed debug output"
+    echo "                         • Shows internal operations"
+    echo "                         • Useful for troubleshooting"
+    echo "                         • Creates detailed logs"
+    echo ""
+    echo -e "${YELLOW}Operation Flags:${NC}"
+    echo "   --check-only          Validate system without building"
+    echo "                         • Tests requirements"
+    echo "                         • Checks disk space"
+    echo "                         • Verifies kernel files"
+    echo "                         • No actual ISO creation"
+    echo ""
+    echo "   --resume              Try to resume previous build"
+    echo "                         • Continues from last checkpoint"
+    echo "                         • Useful for interrupted builds"
+    echo "                         • Uses saved state information"
+    echo ""
+    echo "   --clean               Clean workspace before starting"
+    echo "                         • Removes previous build files"
+    echo "                         • Forces fresh start"
+    echo "                         • Useful for troubleshooting"
+    echo ""
+    echo -e "${YELLOW}Flag Combinations:${NC}"
+    echo "   $0 -qd /build/dir     Quiet mode with debug logging"
+    echo "   $0 --clean --debug    Clean start with detailed output"
+    echo "   $0 -q --check-only    Silent system validation"
+    echo ""
+    echo -e "${YELLOW}Environment Variables:${NC}"
+    echo "   WORKDIR               Override default work directory"
+    echo "   DEBIAN_FRONTEND       Set to 'noninteractive' for automation"
+    echo ""
+    echo "   Example:"
+    echo "   export WORKDIR=/mnt/build"
+    echo "   $0 -q"
+}
+
+# Enhanced help function that handles topics
+show_help() {
+    local topic="${1:-}"
+    
+    case "$topic" in
+        "usage"|"")
+            show_help_usage
+            ;;
+        "examples")
+            show_help_examples
+            ;;
+        "distributions"|"distros")
+            show_help_distributions
+            ;;
+        "troubleshooting"|"trouble"|"issues")
+            show_help_troubleshooting
+            ;;
+        "requirements"|"req"|"system")
+            show_help_requirements
+            ;;
+        "space"|"disk"|"storage")
+            show_help_space
+            ;;
+        "kernels"|"kernel")
+            show_help_kernels
+            ;;
+        "bootmodes"|"boot"|"modes")
+            show_help_bootmodes
+            ;;
+        "persistence"|"persist")
+            show_help_persistence
+            ;;
+        "kali")
+            show_help_kali
+            ;;
+        "flags"|"options")
+            show_help_flags
+            ;;
+        "menu"|"topics")
+            show_help_menu
+            ;;
+        *)
+            echo -e "${RED}Unknown help topic: $topic${NC}"
+            echo ""
+            show_help_menu
+            ;;
+    esac
+}
 
 # ========================================
 #    LOGGING AND UI FUNCTIONS
@@ -1771,35 +2348,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Now with improved error handling and number validation${NC}"
-    echo ""
-}
-
-show_usage() {
-    echo "Usage: $0 [OPTIONS] [WORK_DIRECTORY]"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help        Show this help message"
-    echo "  -v, --version     Show version information"
-    echo "  -q, --quiet       Minimal output"
-    echo "  -d, --debug       Enable debug output"
-    echo ""
-    echo "Arguments:"
-    echo "  WORK_DIRECTORY    Directory for build files (default: $DEFAULT_WORKDIR)"
-    echo ""
-    echo "Supported Distributions:"
-    echo "  - Ubuntu and derivatives (Ubuntu, Kubuntu, Xubuntu, etc.)"
-    echo "  - Debian"
-    echo "  - Kali Linux"
-    echo "  - Linux Mint"
-    echo "  - Pop!_OS"
-    echo "  - Elementary OS"
-    echo "  - Zorin OS"
-    echo ""
-    echo "Examples:"
-    echo "  $0                           # Use default directory"
-    echo "  $0 /home/user/iso-build     # Use custom directory"
-    echo "  $0 -q /mnt/usb/build        # Quiet mode with USB drive"
+    echo -e "${GREEN}Now with comprehensive help system and enhanced flags${NC}"
     echo ""
 }
 
@@ -1869,19 +2418,99 @@ check_resume_capability() {
 }
 
 # ========================================
+#    ENHANCED ARGUMENT PARSING
+# ========================================
+
+parse_arguments() {
+    QUIET_MODE=false
+    DEBUG_MODE=false
+    CHECK_ONLY=false
+    RESUME_BUILD=false
+    CLEAN_BUILD=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help "$2"
+                exit 0
+                ;;
+            -v|--version)
+                echo "Enhanced AutoISO v$SCRIPT_VERSION"
+                echo "Professional Live ISO Creator with Kali Linux Support"
+                echo "Now with enhanced help system and improved error handling!"
+                exit 0
+                ;;
+            -q|--quiet)
+                QUIET_MODE=true
+                shift
+                ;;
+            -d|--debug)
+                DEBUG_MODE=true
+                shift
+                ;;
+            --check-only)
+                CHECK_ONLY=true
+                shift
+                ;;
+            --resume)
+                RESUME_BUILD=true
+                shift
+                ;;
+            --clean)
+                CLEAN_BUILD=true
+                shift
+                ;;
+            -*)
+                echo -e "${RED}Unknown option: $1${NC}"
+                echo "Use '$0 --help' for usage information"
+                exit 1
+                ;;
+            *)
+                WORKDIR="$1/autoiso-build"
+                shift
+                ;;
+        esac
+    done
+}
+
+# ========================================
 #    MAIN WORKFLOW
 # ========================================
 
 main() {
+    # Parse arguments first
+    parse_arguments "$@"
+    
     # Show welcome
-    show_welcome
+    if [[ "$QUIET_MODE" != "true" ]]; then
+        show_welcome
+    fi
     
     # Setup logging
     setup_logging
     
-    # Check for resume
+    # Handle special modes
+    if [[ "$CHECK_ONLY" == "true" ]]; then
+        log_info "Running system validation only..."
+        if validate_system; then
+            log_success "✓ System validation passed - ready to build ISO"
+            exit 0
+        else
+            log_error "✗ System validation failed"
+            exit 1
+        fi
+    fi
+    
+    # Handle clean build
+    if [[ "$CLEAN_BUILD" == "true" ]]; then
+        log_info "Cleaning previous build files..."
+        $SUDO rm -rf "$WORKDIR"
+        log_success "Workspace cleaned"
+    fi
+    
+    # Check for resume capability
     local resume_build=false
-    if check_resume_capability; then
+    if [[ "$RESUME_BUILD" == "true" ]] || check_resume_capability; then
         resume_build=true
     fi
     
@@ -1932,41 +2561,6 @@ main() {
 # ========================================
 #    ENTRY POINT
 # ========================================
-
-# Parse command line arguments
-QUIET_MODE=false
-DEBUG_MODE=false
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        -v|--version)
-            echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Now with improved kernel detection and Kali Linux support!"
-            exit 0
-            ;;
-        -q|--quiet)
-            QUIET_MODE=true
-            shift
-            ;;
-        -d|--debug)
-            DEBUG_MODE=true
-            shift
-            ;;
-        -*)
-            echo "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
-        *)
-            WORKDIR="$1/autoiso-build"
-            shift
-            ;;
-    esac
-done
 
 # Set default work directory if not specified
 : "${WORKDIR:=$DEFAULT_WORKDIR}"
