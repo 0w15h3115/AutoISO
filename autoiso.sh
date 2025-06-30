@@ -122,6 +122,129 @@ show_progress_bar() {
 }
 
 # ========================================
+#    INTERACTIVE DISK SELECTION
+# ========================================
+
+get_available_disks() {
+    # Get disk information with better formatting
+    echo ""
+    echo -e "${BOLD}${CYAN}Available Storage Locations:${NC}"
+    echo ""
+    
+    # Show system disk usage
+    echo "📊 Current system disk usage:"
+    df -h / | awk 'NR==2 {printf "   Root (/): %s used, %s available (%s total)\n", $3, $4, $2}'
+    echo ""
+    
+    # Detect and list available disks
+    local disk_options=()
+    local disk_descriptions=()
+    
+    # Default option
+    disk_options+=("$DEFAULT_WORKDIR")
+    disk_descriptions+=("Default location (system disk)")
+    
+    # Home directory option
+    if [[ -d "$HOME" ]]; then
+        local home_available
+        home_available=$(df "$HOME" | awk 'NR==2 {print $4}')
+        home_available=$((home_available / 1024 / 1024))  # Convert to GB
+        disk_options+=("$HOME/autoiso-build")
+        disk_descriptions+=("Home directory (~${home_available}GB available)")
+    fi
+    
+    # External drives and mount points
+    local external_drives=()
+    while IFS= read -r line; do
+        local device=$(echo "$line" | awk '{print $1}')
+        local mountpoint=$(echo "$line" | awk '{print $6}')
+        local available=$(echo "$line" | awk '{print $4}')
+        local filesystem=$(echo "$line" | awk '{print $5}')
+        
+        # Skip system mounts and small drives
+        if [[ "$mountpoint" =~ ^/(media|mnt)/ ]] && [[ $available -gt 10485760 ]]; then  # > 10GB
+            local available_gb=$((available / 1024 / 1024))
+            disk_options+=("$mountpoint/autoiso-build")
+            local label=""
+            if [[ "$mountpoint" =~ /media/ ]]; then
+                label="External drive"
+            else
+                label="Mounted storage"
+            fi
+            disk_descriptions+=("$label at $mountpoint (~${available_gb}GB available)")
+        fi
+    done < <(df -k | grep -E '^/dev/' | grep -v -E '/(snap|boot|proc|sys|dev|run)')
+    
+    # Display options
+    local i=1
+    for ((j=0; j<${#disk_options[@]}; j++)); do
+        printf "%2d) %s\n" "$i" "${disk_descriptions[$j]}"
+        printf "    📁 %s\n" "${disk_options[$j]}"
+        echo ""
+        ((i++))
+    done
+    
+    echo "💡 Custom path) Enter custom directory path"
+    echo ""
+    
+    # Get user selection
+    while true; do
+        read -p "Select storage location [1-$((${#disk_options[@]}))]: " -r choice
+        
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ $choice -ge 1 ]] && [[ $choice -le ${#disk_options[@]} ]]; then
+            local selected_index=$((choice - 1))
+            WORKDIR="${disk_options[$selected_index]}"
+            break
+        elif [[ "$choice" =~ ^[Cc]$ ]] || [[ "$choice" == "custom" ]]; then
+            read -p "Enter custom directory path: " -r custom_path
+            if [[ -n "$custom_path" ]]; then
+                WORKDIR="$custom_path/autoiso-build"
+                break
+            else
+                echo "Invalid path. Please try again."
+            fi
+        else
+            echo "Invalid selection. Please choose 1-$((${#disk_options[@]})) or 'custom'."
+        fi
+    done
+    
+    echo ""
+    log_info "Selected work directory: $WORKDIR"
+    
+    # Validate the selection
+    if ! validate_work_directory "$WORKDIR"; then
+        log_error "Invalid work directory selection"
+        return 1
+    fi
+    
+    return 0
+}
+
+validate_work_directory() {
+    local dir="$1"
+    local parent_dir=$(dirname "$dir")
+    
+    # Check if parent directory exists or can be created
+    if [[ ! -d "$parent_dir" ]]; then
+        log_error "Parent directory does not exist: $parent_dir"
+        return 1
+    fi
+    
+    # Check write permissions
+    if [[ ! -w "$parent_dir" ]]; then
+        log_warning "No write permission to $parent_dir, will use sudo"
+    fi
+    
+    # Check path length
+    if [[ ${#dir} -gt $MAX_PATH_LENGTH ]]; then
+        log_error "Path too long (${#dir} > $MAX_PATH_LENGTH characters)"
+        return 1
+    fi
+    
+    return 0
+}
+
+# ========================================
 #    STATE MANAGEMENT
 # ========================================
 
@@ -1158,7 +1281,7 @@ create_squashfs_enhanced() {
     log_info "Creating compressed filesystem... This typically takes 5-15 minutes."
     echo ""
     
-    # Run mksquashfs in background with simple file size monitoring
+    # FIXED: Run mksquashfs in background with simple file size monitoring
     local start_time=$(date +%s)
     local mksquashfs_log="$WORKDIR/logs/mksquashfs.log"
     
@@ -1661,7 +1784,7 @@ create_iso_enhanced() {
     log_info "Building ISO image... This usually takes 1-3 minutes."
     echo ""
     
-    # Execute with simple monitoring (no complex pipeline that can hang)
+    # FIXED: Execute with simple monitoring (no complex pipeline that can hang)
     local start_time=$(date +%s)
     local xorriso_log="$WORKDIR/logs/xorriso-output.log"
     
@@ -1850,7 +1973,7 @@ show_usage() {
     echo "  -d, --debug       Enable debug output"
     echo ""
     echo "Arguments:"
-    echo "  WORK_DIRECTORY    Directory for build files (default: $DEFAULT_WORKDIR)"
+    echo "  WORK_DIRECTORY    Directory for build files (default: interactive selection)"
     echo ""
     echo "Supported Distributions:"
     echo "  - Ubuntu and derivatives (Ubuntu, Kubuntu, Xubuntu, etc.)"
@@ -1862,7 +1985,7 @@ show_usage() {
     echo "  - Zorin OS"
     echo ""
     echo "Examples:"
-    echo "  $0                           # Use default directory"
+    echo "  $0                           # Interactive disk selection"
     echo "  $0 /home/user/iso-build     # Use custom directory"
     echo "  $0 -q /mnt/usb/build        # Quiet mode with USB drive"
     echo ""
@@ -1941,6 +2064,14 @@ main() {
     # Show welcome
     show_welcome
     
+    # Handle work directory selection
+    if [[ -z "${WORKDIR_OVERRIDE:-}" ]]; then
+        if ! get_available_disks; then
+            log_error "Failed to select work directory"
+            exit 1
+        fi
+    fi
+    
     # Setup logging
     setup_logging
     
@@ -2001,6 +2132,7 @@ main() {
 # Parse command line arguments
 QUIET_MODE=false
 DEBUG_MODE=false
+WORKDIR_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2027,14 +2159,19 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
         *)
-            WORKDIR="$1/autoiso-build"
+            WORKDIR_OVERRIDE="$1/autoiso-build"
+            WORKDIR="$WORKDIR_OVERRIDE"
             shift
             ;;
     esac
 done
 
-# Set default work directory if not specified
-: "${WORKDIR:=$DEFAULT_WORKDIR}"
+# Set default work directory if not specified via command line
+if [[ -n "$WORKDIR_OVERRIDE" ]]; then
+    WORKDIR="$WORKDIR_OVERRIDE"
+else
+    WORKDIR="$DEFAULT_WORKDIR"  # Will be overridden by interactive selection
+fi
 
 # Resolve paths
 WORKDIR=$(realpath "$WORKDIR" 2>/dev/null || echo "$WORKDIR")
