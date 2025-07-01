@@ -731,7 +731,7 @@ enhanced_rsync() {
         total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB in bytes
     fi
     
-    total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
+    total_size_human=$(numfmt --to=si --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
     
     log_info "Estimated data to copy: $total_size_human"
     echo ""
