@@ -778,19 +778,36 @@ enhanced_rsync() {
     local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
     
-    # Start rsync with timeout and simplified monitoring
+    # Start rsync with better signal handling
     log_info "Running rsync with 1-hour timeout..."
     echo ""
     
-    # Create a simple progress monitor that won't cause hanging
+    # Create a more robust rsync execution with proper signal handling
+    local rsync_pid
+    local monitor_pid
+    
+    # Start rsync in background without timeout interference
+    $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" > "$stats_file" 2>&1 &
+    rsync_pid=$!
+    
+    # Start a separate timeout monitor
     (
-        # Run rsync in background with timeout
-        timeout $RSYNC_TIMEOUT $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" > "$stats_file" 2>&1 &
-        local rsync_pid=$!
+        local timeout_seconds=$RSYNC_TIMEOUT
         
-        # Simple progress display
         while kill -0 $rsync_pid 2>/dev/null; do
-            local elapsed=$(($(date +%s) - start_time))
+            local current_time=$(date +%s)
+            local elapsed=$((current_time - start_time))
+            
+            # Check timeout
+            if [[ $elapsed -ge $timeout_seconds ]]; then
+                log_warning "Rsync timeout reached, terminating process..."
+                kill -TERM $rsync_pid 2>/dev/null
+                sleep 5
+                kill -9 $rsync_pid 2>/dev/null || true
+                echo "124" > "$WORKDIR/.rsync_exit_code"  # timeout exit code
+                break
+            fi
+            
             local minutes=$((elapsed / 60))
             local seconds=$((elapsed % 60))
             
@@ -805,15 +822,19 @@ enhanced_rsync() {
             
             sleep 5
         done
-        
-        # Wait for rsync to complete and get exit code
-        wait $rsync_pid
-        echo $? > "$WORKDIR/.rsync_exit_code"
     ) &
+    monitor_pid=$!
     
-    # Wait for the monitoring process
-    local monitor_pid=$!
-    wait $monitor_pid
+    # Wait for rsync to complete
+    wait $rsync_pid
+    local rsync_status=$?
+    
+    # Clean up monitor process
+    kill $monitor_pid 2>/dev/null || true
+    wait $monitor_pid 2>/dev/null || true
+    
+    # Store the actual rsync exit code
+    echo "$rsync_status" > "$WORKDIR/.rsync_exit_code"
     
     echo "" # New line after progress
     
@@ -824,6 +845,10 @@ enhanced_rsync() {
     fi
     
     if [[ $rsync_status -eq 0 ]]; then
+        local elapsed=$(($(date +%s) - start_time))
+        local minutes=$((elapsed / 60))
+        local seconds=$((elapsed % 60))
+        
         # Parse final statistics
         if [[ -f "$stats_file" ]]; then
             local files_transferred=$(grep -E "Number of.*files transferred:" "$stats_file" | awk '{print $NF}' || echo "N/A")
@@ -835,6 +860,7 @@ enhanced_rsync() {
             log_success "System copy completed successfully!"
             echo ""
             echo -e "${BOLD}Copy Statistics:${NC}"
+            echo -e "  ${CYAN}Time taken:${NC}        ${minutes}m ${seconds}s"
             echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
             echo -e "  ${CYAN}Total size:${NC}        $total_size"
             echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
@@ -853,6 +879,12 @@ enhanced_rsync() {
         echo ""
         if [[ $rsync_status -eq 124 ]]; then
             log_error "Rsync timed out after $RSYNC_TIMEOUT seconds"
+        elif [[ $rsync_status -eq 19 ]]; then
+            log_error "Rsync received SIGUSR1 signal - possibly interrupted"
+        elif [[ $rsync_status -eq 20 ]]; then
+            log_error "Rsync received termination signal (SIGINT/SIGTERM/SIGHUP)"
+        elif [[ $rsync_status -eq 23 ]]; then
+            log_error "Rsync partial transfer due to error"
         fi
         echo "Check the log file for details: $rsync_log"
         echo "Check the stats file for details: $stats_file"
