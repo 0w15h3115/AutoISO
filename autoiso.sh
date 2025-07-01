@@ -1,6 +1,5 @@
 #!/bin/bash
 # Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Kali Linux Support
-# Fixed rsync hanging while preserving all original functionality
 
 set -euo pipefail
 
