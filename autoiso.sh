@@ -969,60 +969,19 @@ enhanced_rsync() {
     local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
     
-    # Start rsync in background
-    $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
-        tee "$stats_file" | \
-        grep -E "to-check=|xfr#" | \
-        while IFS= read -r line; do
-            # Parse rsync output for better progress display
-            if [[ "$line" =~ to-check=([0-9]+)/([0-9]+) ]]; then
-                local remaining="${BASH_REMATCH[1]}"
-                local total="${BASH_REMATCH[2]}"
-                local completed=$((total - remaining))
-                local percent=$((completed * 100 / total))
-                
-                # Calculate speed and ETA
-                local current_time=$(date +%s)
-                local elapsed=$((current_time - start_time))
-                
-                if [[ $elapsed -gt 0 && $completed -gt 0 ]]; then
-                    local rate=$((completed / elapsed))
-                    local eta=$((remaining / rate))
-                    local eta_min=$((eta / 60))
-                    local eta_sec=$((eta % 60))
-                    
-                    # Format the progress line
-                    printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% " \
-                        "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
-                        "$percent"
-                    
-                    printf "${CYAN}Files:${NC} %d/%d " "$completed" "$total"
-                    
-                    if [[ $eta_min -gt 0 ]]; then
-                        printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
-                    else
-                        printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
-                    fi
-                fi
-            elif [[ "$line" =~ xfr#([0-9]+),.*to-chk=([0-9]+)/([0-9]+) ]]; then
-                # Alternative parsing for different rsync versions
-                local transferred="${BASH_REMATCH[1]}"
-                local remaining="${BASH_REMATCH[2]}"
-                local total="${BASH_REMATCH[3]}"
-                local completed=$((total - remaining))
-                local percent=$((completed * 100 / total))
-                
-                printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% ${CYAN}Files:${NC} %d/%d     " \
-                    "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
-                    "$percent" "$completed" "$total"
-            fi
-        done &
+    # Start rsync with simpler progress monitoring
+    echo "Starting rsync - this may take 10-30 minutes..."
     
-    # Wait for rsync to complete
-    wait
-    local rsync_status=$?
+    # Run rsync and capture its exit status directly
+    if $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | tee "$stats_file"; then
+        local rsync_status=0
+    else
+        local rsync_status=$?
+    fi
     
     echo "" # New line after progress
+    
+    log_debug "Rsync completed with status: $rsync_status"
     
     if [[ $rsync_status -eq 0 ]]; then
         # Parse final statistics
