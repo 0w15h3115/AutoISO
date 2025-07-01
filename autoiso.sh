@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ========================================
-#                AUTOISO 
+#    ENHANCED AUTOISO - ENTERPRISE GRADE
 # ========================================
 
 # Global configuration
@@ -930,11 +930,23 @@ enhanced_rsync() {
     log_info "Estimated data to copy: $total_size_human"
     echo ""
     
-    # Optimized exclusion list with Kali-specific additions
+    # Optimized exclusion list with GVFS and ephemeral file exclusions
     local exclude_patterns=(
         "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
         "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
         "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
+        "*/.local/share/gvfs-metadata/*"
+        "*/.gvfs"
+        "*/.dbus"
+        "*/gvfs-metadata/*"
+        "*/.local/share/recently-used.xbel*"
+        "*/.local/share/Trash/*"
+        "*/.thumbnails/*"
+        "*/.cache/thumbnails/*"
+        "/home/*/.mozilla/*/crash-reports/*"
+        "/home/*/.config/google-chrome/crash-reports/*"
+        "/home/*/.xsession-errors*"
+        "/var/crash/*"
     )
     
     # Add Kali-specific exclusions if needed
@@ -955,6 +967,7 @@ enhanced_rsync() {
         --log-file="$rsync_log"
         --stats
         --human-readable
+        --ignore-missing-args
     )
     
     for pattern in "${exclude_patterns[@]}"; do
