@@ -767,7 +767,6 @@ enhanced_rsync() {
     done
     
     log_info "Starting system copy... This may take 10-30 minutes depending on system size and disk speed."
-    log_info "Note: Progress monitoring optimized to reduce I/O contention with rsync."
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
