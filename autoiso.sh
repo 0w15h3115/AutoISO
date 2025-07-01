@@ -713,8 +713,6 @@ enhanced_rsync() {
     show_header "System Copy"
     
     local rsync_log="$WORKDIR/logs/rsync.log"
-    local rsync_partial_dir="$WORKDIR/.rsync-partial"
-    mkdir -p "$rsync_partial_dir"
     
     # First, estimate the total size to copy
     log_info "Calculating system size for accurate progress..."
@@ -755,21 +753,21 @@ enhanced_rsync() {
     fi
     
     local rsync_opts=(
-        -aAXHx
-        --partial
-        --partial-dir="$rsync_partial_dir"
+        -aHx
         --numeric-ids
         --one-file-system
         --log-file="$rsync_log"
         --stats
         --human-readable
+        --whole-file
     )
     
     for pattern in "${exclude_patterns[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
-    log_info "Starting system copy... This may take 10-30 minutes depending on system size."
+    log_info "Starting system copy... This may take 10-30 minutes depending on system size and disk speed."
+    log_info "Note: Progress monitoring optimized to reduce I/O contention with rsync."
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
@@ -777,8 +775,8 @@ enhanced_rsync() {
     local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
     
-    # Start rsync with better signal handling
-    log_info "Running rsync..."
+    # Start rsync with performance optimizations
+    log_info "Running rsync (optimized for speed)..."
     echo ""
     
     # Create a more robust rsync execution with proper signal handling
@@ -789,7 +787,7 @@ enhanced_rsync() {
     $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" > "$stats_file" 2>&1 &
     rsync_pid=$!
     
-    # Start a separate progress monitor
+    # Start a separate progress monitor (optimized for performance)
     (
         while kill -0 $rsync_pid 2>/dev/null; do
             local current_time=$(date +%s)
@@ -797,16 +795,11 @@ enhanced_rsync() {
             local minutes=$((elapsed / 60))
             local seconds=$((elapsed % 60))
             
-            # Show current size being copied
-            local current_size="0"
-            if [[ -d "$EXTRACT_DIR" ]]; then
-                current_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "0")
-            fi
+            # Show only time to avoid I/O contention with rsync
+            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d (rsync in progress)     " \
+                "$minutes" "$seconds"
             
-            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d Current size: %s     " \
-                "$minutes" "$seconds" "$current_size"
-            
-            sleep 5
+            sleep 15
         done
     ) &
     monitor_pid=$!
@@ -852,10 +845,10 @@ enhanced_rsync() {
             echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
             echo -e "  ${CYAN}Compression ratio:${NC} $speedup"
             
-            # Show actual copied size
+            # Show final copied size
             local copied_size
             copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
-            echo -e "  ${CYAN}Size on disk:${NC}      $copied_size"
+            echo -e "  ${CYAN}Final size on disk:${NC} $copied_size"
         fi
         
         save_state "rsync_complete"
@@ -1795,7 +1788,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Fixed rsync hanging and improved number validation${NC}"
+    echo -e "${GREEN}Fixed rsync performance issues and improved reliability${NC}"
     echo ""
 }
 
