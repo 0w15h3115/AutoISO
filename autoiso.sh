@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ========================================
-#    ENHANCED AUTOISO - ENTERPRISE GRADE
+#                AUTOISO 
 # ========================================
 
 # Global configuration
