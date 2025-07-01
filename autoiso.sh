@@ -14,7 +14,6 @@ readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
 readonly DEFAULT_WORKDIR="/tmp/autoiso-build"
-readonly RSYNC_TIMEOUT=3600  # 1 hour timeout for rsync
 
 # Global state management
 declare -A SCRIPT_STATE=(
@@ -779,7 +778,7 @@ enhanced_rsync() {
     local start_time=$(date +%s)
     
     # Start rsync with better signal handling
-    log_info "Running rsync with 1-hour timeout..."
+    log_info "Running rsync..."
     echo ""
     
     # Create a more robust rsync execution with proper signal handling
@@ -790,24 +789,11 @@ enhanced_rsync() {
     $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" > "$stats_file" 2>&1 &
     rsync_pid=$!
     
-    # Start a separate timeout monitor
+    # Start a separate progress monitor
     (
-        local timeout_seconds=$RSYNC_TIMEOUT
-        
         while kill -0 $rsync_pid 2>/dev/null; do
             local current_time=$(date +%s)
             local elapsed=$((current_time - start_time))
-            
-            # Check timeout
-            if [[ $elapsed -ge $timeout_seconds ]]; then
-                log_warning "Rsync timeout reached, terminating process..."
-                kill -TERM $rsync_pid 2>/dev/null
-                sleep 5
-                kill -9 $rsync_pid 2>/dev/null || true
-                echo "124" > "$WORKDIR/.rsync_exit_code"  # timeout exit code
-                break
-            fi
-            
             local minutes=$((elapsed / 60))
             local seconds=$((elapsed % 60))
             
@@ -877,9 +863,7 @@ enhanced_rsync() {
     else
         log_error "System copy failed (exit code: $rsync_status)"
         echo ""
-        if [[ $rsync_status -eq 124 ]]; then
-            log_error "Rsync timed out after $RSYNC_TIMEOUT seconds"
-        elif [[ $rsync_status -eq 19 ]]; then
+        if [[ $rsync_status -eq 19 ]]; then
             log_error "Rsync received SIGUSR1 signal - possibly interrupted"
         elif [[ $rsync_status -eq 20 ]]; then
             log_error "Rsync received termination signal (SIGINT/SIGTERM/SIGHUP)"
