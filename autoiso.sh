@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.2.0 - Professional Live ISO Creator with Smart Compression
-# Optimized for reliability, performance, and user experience
+# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Kali Linux Support
+# Fixed rsync hanging and improved reliability
 
 set -euo pipefail
 
@@ -9,11 +9,12 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.1.3"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
 readonly DEFAULT_WORKDIR="/tmp/autoiso-build"
+readonly RSYNC_TIMEOUT=3600  # 1 hour timeout for rsync
 
 # Global state management
 declare -A SCRIPT_STATE=(
@@ -22,7 +23,6 @@ declare -A SCRIPT_STATE=(
     [mounts_active]="false"
     [start_time]=$(date +%s)
     [distribution]=""
-    [compression_method]=""
 )
 
 # Color codes for better UX
@@ -138,7 +138,6 @@ WORKDIR=$WORKDIR
 TIMESTAMP=$(date +%s)
 START_TIME=${SCRIPT_STATE[start_time]}
 DISTRIBUTION=${SCRIPT_STATE[distribution]}
-COMPRESSION_METHOD=${SCRIPT_STATE[compression_method]}
 PID=$$
 EOF
     log_debug "State saved: $stage"
@@ -152,7 +151,6 @@ load_state() {
         SCRIPT_STATE[mounts_active]="$MOUNTS_ACTIVE"
         SCRIPT_STATE[start_time]="${START_TIME:-$(date +%s)}"
         SCRIPT_STATE[distribution]="${DISTRIBUTION:-}"
-        SCRIPT_STATE[compression_method]="${COMPRESSION_METHOD:-}"
         log_info "Loaded previous state: ${SCRIPT_STATE[stage]}"
         return 0
     fi
@@ -165,6 +163,15 @@ load_state() {
 
 cleanup_all() {
     log_info "Starting cleanup process..."
+    
+    # Kill any background processes we might have started
+    local autoiso_pids=$(pgrep -f "autoiso.sh" | grep -v $$ || true)
+    if [[ -n "$autoiso_pids" ]]; then
+        log_debug "Cleaning up background processes: $autoiso_pids"
+        kill -TERM $autoiso_pids 2>/dev/null || true
+        sleep 2
+        kill -9 $autoiso_pids 2>/dev/null || true
+    fi
     
     # Show cleanup progress
     local cleanup_steps=("Unmounting filesystems" "Removing temporary files" "Closing logs")
@@ -247,209 +254,6 @@ error_handler() {
 # Set up error handling
 trap 'error_handler ${LINENO} $?' ERR
 trap cleanup_all EXIT INT TERM
-
-# ========================================
-#    COMPRESSION METHOD SELECTION
-# ========================================
-
-detect_system_specs() {
-    local cpu_cores=$(nproc)
-    local ram_gb=$(($(free -m | awk '/^Mem:/ {print $2}') / 1024))
-    local is_ssd=false
-    
-    # Try to detect if we're on SSD (rough heuristic)
-    local workdir_device=$(df --output=source "$WORKDIR" | tail -1 | sed 's|/dev/||' | sed 's|[0-9]*$||')
-    if [[ -f "/sys/block/$workdir_device/queue/rotational" ]]; then
-        local rotational=$(cat "/sys/block/$workdir_device/queue/rotational" 2>/dev/null || echo "1")
-        [[ "$rotational" == "0" ]] && is_ssd=true
-    fi
-    
-    echo "$cpu_cores:$ram_gb:$is_ssd"
-}
-
-estimate_compression_time() {
-    local compression="$1"
-    local source_size_gb="$2"
-    local system_specs="$3"
-    
-    IFS=':' read -r cpu_cores ram_gb is_ssd <<< "$system_specs"
-    
-    local base_time_min
-    case "$compression" in
-        "lz4")     base_time_min=$((source_size_gb * 1)) ;;
-        "gzip")    base_time_min=$((source_size_gb * 3)) ;;
-        "gzip-9")  base_time_min=$((source_size_gb * 4)) ;;
-        "xz")      base_time_min=$((source_size_gb * 15)) ;;
-        *)         base_time_min=$((source_size_gb * 3)) ;;
-    esac
-    
-    # Adjust for CPU cores
-    base_time_min=$((base_time_min / cpu_cores))
-    
-    # Adjust for storage type
-    if [[ "$is_ssd" == "false" ]]; then
-        base_time_min=$((base_time_min * 2))
-    fi
-    
-    # Minimum 2 minutes
-    [[ $base_time_min -lt 2 ]] && base_time_min=2
-    
-    echo "$base_time_min"
-}
-
-choose_compression_method() {
-    show_header "Compression Method Selection"
-    
-    # Analyze system to make smart recommendations
-    local system_specs
-    system_specs=$(detect_system_specs)
-    IFS=':' read -r cpu_cores ram_gb is_ssd <<< "$system_specs"
-    
-    log_info "System analysis:"
-    echo -e "  ${CYAN}CPU cores:${NC} $cpu_cores"
-    echo -e "  ${CYAN}RAM:${NC} ${ram_gb}GB"
-    echo -e "  ${CYAN}Storage:${NC} $([ "$is_ssd" == "true" ] && echo "SSD" || echo "HDD")"
-    echo ""
-    
-    # Calculate estimated source size for time estimates
-    local source_size_gb=15  # Default estimate
-    if [[ -d "$EXTRACT_DIR" ]]; then
-        local source_size_mb
-        source_size_mb=$(du -sm "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "15000")
-        if [[ "$source_size_mb" =~ ^[0-9]+$ ]]; then
-            source_size_gb=$((source_size_mb / 1024))
-            [[ $source_size_gb -lt 1 ]] && source_size_gb=1
-        fi
-    fi
-    
-    log_info "Estimated source size: ~${source_size_gb}GB"
-    echo ""
-    
-    # Present compression options with time estimates
-    echo -e "${BOLD}Available compression methods:${NC}"
-    echo ""
-    
-    local lz4_time=$(estimate_compression_time "lz4" "$source_size_gb" "$system_specs")
-    local gzip_time=$(estimate_compression_time "gzip" "$source_size_gb" "$system_specs")
-    local gzip9_time=$(estimate_compression_time "gzip-9" "$source_size_gb" "$system_specs")
-    local xz_time=$(estimate_compression_time "xz" "$source_size_gb" "$system_specs")
-    
-    echo "1) 🚀 FAST (LZ4)        - Fastest compression"
-    echo "   └─ Time: ~${lz4_time} minutes | Size: Larger (~90% of original)"
-    echo "   └─ Best for: Quick testing, time-critical builds"
-    echo ""
-    
-    echo "2) ⚖️  BALANCED (GZIP)   - Good speed/size balance [RECOMMENDED]"
-    echo "   └─ Time: ~${gzip_time} minutes | Size: Good (~60% of original)"
-    echo "   └─ Best for: Production ISOs, general use"
-    echo ""
-    
-    echo "3) 📦 LEGACY (GZIP-9)   - Compatible with older systems"
-    echo "   └─ Time: ~${gzip9_time} minutes | Size: Good (~65% of original)"
-    echo "   └─ Best for: Maximum compatibility"
-    echo ""
-    
-    echo "4) 🗜️  MAXIMUM (XZ)      - Best compression"
-    echo "   └─ Time: ~${xz_time} minutes+ | Size: Smallest (~40% of original)"
-    echo "   └─ Best for: Archival, bandwidth-limited distribution"
-    if [[ $xz_time -gt 30 ]]; then
-        echo "   └─ ${YELLOW}⚠ WARNING: This will take a very long time!${NC}"
-    fi
-    echo ""
-    
-    # Make smart recommendation
-    local recommended=2
-    if [[ $cpu_cores -ge 8 && $ram_gb -ge 16 && "$is_ssd" == "true" ]]; then
-        if [[ $source_size_gb -le 10 ]]; then
-            recommended=2  # Balanced for good systems with small source
-        else
-            recommended=1  # Fast for good systems with large source
-        fi
-    elif [[ $cpu_cores -le 2 || $ram_gb -le 4 ]]; then
-        recommended=1  # Fast for weak systems
-    fi
-    
-    echo -e "${CYAN}💡 Recommended for your system: Option $recommended${NC}"
-    echo ""
-    
-    local choice
-    while true; do
-        read -p "Choose compression method [1-4, default=$recommended]: " choice
-        choice=${choice:-$recommended}
-        
-        if [[ "$choice" =~ ^[1-4]$ ]]; then
-            break
-        else
-            echo "Please enter 1, 2, 3, or 4"
-        fi
-    done
-    
-    # Set compression method
-    case "$choice" in
-        1) SCRIPT_STATE[compression_method]="lz4" ;;
-        2) SCRIPT_STATE[compression_method]="gzip" ;;
-        3) SCRIPT_STATE[compression_method]="gzip-9" ;;
-        4) SCRIPT_STATE[compression_method]="xz" ;;
-    esac
-    
-    local selected_time
-    selected_time=$(estimate_compression_time "${SCRIPT_STATE[compression_method]}" "$source_size_gb" "$system_specs")
-    
-    echo ""
-    log_success "Selected: ${SCRIPT_STATE[compression_method]^^} compression"
-    log_info "Estimated compression time: ~${selected_time} minutes"
-    
-    # Special warning for XZ
-    if [[ "${SCRIPT_STATE[compression_method]}" == "xz" && $selected_time -gt 30 ]]; then
-        echo ""
-        echo -e "${YELLOW}${BOLD}⚠ IMPORTANT XZ COMPRESSION WARNING ⚠${NC}"
-        echo -e "${YELLOW}XZ compression can take HOURS on large systems.${NC}"
-        echo -e "${YELLOW}Estimated time: ${selected_time}+ minutes${NC}"
-        echo ""
-        read -p "Are you sure you want to continue with XZ? [y/N]: " confirm
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            echo "Switching to GZIP compression for better performance..."
-            SCRIPT_STATE[compression_method]="gzip"
-        fi
-    fi
-    
-    save_state "compression_selected"
-    return 0
-}
-
-get_squashfs_options() {
-    local compression="${SCRIPT_STATE[compression_method]}"
-    local cpu_cores=$(nproc)
-    local ram_total=$(free -m | awk '/^Mem:/ {print $2}')
-    local mem_limit=$((ram_total / 3))  # Use 1/3 of RAM
-    
-    # Base options
-    local opts=(
-        -no-exports
-        -noappend
-        -comp "$compression"
-        -processors "$cpu_cores"
-        -mem "${mem_limit}M"
-    )
-    
-    # Add compression-specific options
-    case "$compression" in
-        "xz")
-            opts+=(-Xbcj x86 -b 1M)
-            ;;
-        "gzip")
-            opts+=(-Xcompression-level 6)
-            ;;
-        "gzip-9")
-            opts+=(-comp gzip -Xcompression-level 9)
-            ;;
-        "lz4")
-            # LZ4 typically doesn't need special options
-            ;;
-    esac
-    
-    echo "${opts[@]}"
-}
 
 # ========================================
 #    VALIDATION FUNCTIONS
@@ -579,16 +383,35 @@ validate_required_tools() {
     return 0
 }
 
+safe_calculate_size() {
+    local path="$1"
+    local result=0
+    
+    # Use timeout to prevent hanging
+    if command -v timeout >/dev/null 2>&1; then
+        result=$(timeout 30 du -sk "$path" 2>/dev/null | cut -f1 || echo "0")
+    else
+        result=$(du -sk "$path" 2>/dev/null | cut -f1 || echo "0")
+    fi
+    
+    # Ensure result is a valid number
+    if [[ ! "$result" =~ ^[0-9]+$ ]]; then
+        result="0"
+    fi
+    
+    echo "$result"
+}
+
 validate_space_detailed() {
     log_info "Analyzing disk space requirements..."
     
-    # Calculate system size using multiple methods
+    # Calculate system size using a safer method
     local system_size_kb
     system_size_kb=$(calculate_system_size_smart)
     
     # Validate the size is a number
-    if [[ ! "$system_size_kb" =~ ^[0-9]+$ ]]; then
-        log_warning "Could not accurately calculate system size, using default estimate"
+    if [[ ! "$system_size_kb" =~ ^[0-9]+$ ]] || [[ "$system_size_kb" -eq 0 ]]; then
+        log_warning "Could not accurately calculate system size, using conservative estimate"
         system_size_kb=$((15 * 1024 * 1024))  # 15GB default
     fi
     
@@ -621,12 +444,14 @@ validate_space_detailed() {
     printf "  %-20s %3d GB\n" "Total required:" "$required_space_gb"
     echo ""
     
-    # Check available space
-    local available_space_gb
-    available_space_gb=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}' || echo "0")
+    # Check available space with safer method
+    local available_space_gb=0
+    local df_output
+    df_output=$(df "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
     
-    # Validate available space is a number
-    if [[ ! "$available_space_gb" =~ ^[0-9]+$ ]]; then
+    if [[ "$df_output" =~ ^[0-9]+$ ]] && [[ "$df_output" -gt 0 ]]; then
+        available_space_gb=$((df_output / 1024 / 1024))
+    else
         log_error "Could not determine available disk space"
         return 1
     fi
@@ -652,70 +477,28 @@ EOF
 }
 
 calculate_system_size_smart() {
-    # Try multiple methods in order of accuracy
-    local size_kb=0
+    # Method 1: Precise calculation with timeout
+    local size_kb
+    size_kb=$(safe_calculate_size "/")
     
-    # Method 1: Precise du calculation
-    if size_kb=$(calculate_size_du); then
-        echo "$size_kb"
-        return 0
-    fi
-    
-    # Method 2: Filesystem analysis
-    if size_kb=$(calculate_size_df); then
-        echo "$size_kb"
-        return 0
-    fi
-    
-    # Method 3: Conservative estimate (higher for Kali)
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        echo $((20 * 1024 * 1024))  # 20GB default for Kali
-    else
-        echo $((15 * 1024 * 1024))  # 15GB default for others
-    fi
-}
-
-calculate_size_du() {
-    local exclude_args=()
-    local exclude_patterns=(
-        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
-        "/var/cache" "/var/log" "/var/tmp" "$WORKDIR"
-    )
-    
-    for pattern in "${exclude_patterns[@]}"; do
-        exclude_args+=(--exclude="$pattern")
-    done
-    
-    local size_output
-    size_output=$(timeout 60 du -sk "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
-    
-    # Ensure we have a valid number
-    if [[ ! "$size_output" =~ ^[0-9]+$ ]]; then
-        echo "0"
-    else
-        echo "$size_output"
-    fi
-}
-
-calculate_size_df() {
-    local used_kb
-    used_kb=$(df / | awk 'NR==2 {print $3}' || echo "0")
-    
-    # Ensure we have a valid number
-    if [[ ! "$used_kb" =~ ^[0-9]+$ ]]; then
-        echo "0"
-        return 1
-    fi
-    
-    # Subtract estimated cache/temp size
-    local cache_size_kb=$((2 * 1024 * 1024))  # 2GB estimate
-    local result=$((used_kb - cache_size_kb))
-    
-    # Ensure result is not negative
-    if [[ $result -lt 0 ]]; then
-        echo "$used_kb"
-    else
+    if [[ "$size_kb" -gt 0 ]]; then
+        # Subtract estimated cache/temp size
+        local cache_size_kb=$((2 * 1024 * 1024))  # 2GB estimate
+        local result=$((size_kb - cache_size_kb))
+        
+        # Ensure result is not negative or too small
+        if [[ $result -lt $((5 * 1024 * 1024)) ]]; then
+            result=$((10 * 1024 * 1024))  # 10GB minimum
+        fi
+        
         echo "$result"
+    else
+        # Conservative fallback
+        if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+            echo $((20 * 1024 * 1024))  # 20GB default for Kali
+        else
+            echo $((15 * 1024 * 1024))  # 15GB default for others
+        fi
     fi
 }
 
@@ -763,12 +546,14 @@ validate_system_health() {
         fi
     done
     
-    # Check system load
-    local load_avg
-    load_avg=$(uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
-    
-    if (( $(echo "$load_avg > 10" | bc -l 2>/dev/null || echo 0) )); then
-        log_warning "High system load: $load_avg"
+    # Check system load (if bc is available)
+    if command -v bc >/dev/null 2>&1; then
+        local load_avg
+        load_avg=$(uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
+        
+        if (( $(echo "$load_avg > 10" | bc -l 2>/dev/null || echo 0) )); then
+            log_warning "High system load: $load_avg"
+        fi
     fi
     
     return 0
@@ -898,125 +683,141 @@ validate_kernel_files() {
 }
 
 # ========================================
-#    CORE BUILD FUNCTIONS
+#    CORE BUILD FUNCTIONS (FIXED RSYNC)
 # ========================================
 
 enhanced_rsync() {
     show_header "System Copy"
     
     local rsync_log="$WORKDIR/logs/rsync.log"
-    local rsync_partial_dir="$WORKDIR/.rsync-partial"
-    mkdir -p "$rsync_partial_dir"
+    local rsync_stats="$WORKDIR/logs/rsync-stats.log"
     
-    # First, estimate the total size to copy
-    log_info "Calculating system size for accurate progress..."
-    local total_size_bytes
-    local total_size_human
+    # Estimate the total size to copy - using safer method
+    log_info "Calculating system size for progress estimation..."
+    local total_size_gb
+    local estimated_size_kb
+    estimated_size_kb=$(safe_calculate_size "/")
     
-    # Get estimated size (this is fast) - ensure we get a valid number
-    local df_output
-    df_output=$(df / | awk 'NR==2 {print $3}' || echo "0")
-    
-    # Validate it's a number
-    if [[ "$df_output" =~ ^[0-9]+$ ]]; then
-        total_size_bytes=$((df_output * 1024))
+    if [[ "$estimated_size_kb" -gt 0 ]]; then
+        total_size_gb=$((estimated_size_kb / 1024 / 1024))
     else
-        # Fallback to a reasonable estimate
-        total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB in bytes
+        total_size_gb=10  # Conservative estimate
     fi
     
-    total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
-    
-    log_info "Estimated data to copy: $total_size_human"
+    log_info "Estimated data to copy: ~${total_size_gb}GB"
     echo ""
     
-    # Optimized exclusion list with GVFS and ephemeral file exclusions
+    # Optimized exclusion list with Kali-specific additions
     local exclude_patterns=(
         "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
         "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
         "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
-        "*/.local/share/gvfs-metadata/*"
-        "*/.gvfs"
-        "*/.dbus"
-        "*/gvfs-metadata/*"
-        "*/.local/share/recently-used.xbel*"
-        "*/.local/share/Trash/*"
-        "*/.thumbnails/*"
-        "*/.cache/thumbnails/*"
-        "/home/*/.mozilla/*/crash-reports/*"
-        "/home/*/.config/google-chrome/crash-reports/*"
-        "/home/*/.xsession-errors*"
-        "/var/crash/*"
+        "/home/*/.cache" "/root/.cache"
     )
     
     # Add Kali-specific exclusions if needed
     if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
         exclude_patterns+=(
-            "/root/.cache"
             "/root/.local/share/Trash"
             "/opt/metasploit-framework/embedded/framework/.git"
+            "/var/lib/postgresql/*/main/pg_log/*"
         )
     fi
     
+    # Simplified rsync options - removed complex progress monitoring
     local rsync_opts=(
         -aAXHx
-        --partial
-        --partial-dir="$rsync_partial_dir"
         --numeric-ids
         --one-file-system
-        --log-file="$rsync_log"
         --stats
         --human-readable
-        --ignore-missing-args
+        --log-file="$rsync_log"
     )
     
     for pattern in "${exclude_patterns[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
-    log_info "Starting system copy... This may take 10-30 minutes depending on system size."
+    log_info "Starting system copy..."
+    log_info "This may take 10-45 minutes depending on system size and disk speed."
+    log_info "Monitor progress in: tail -f $rsync_log"
+    echo ""
+    
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
-    # Create a background process to monitor progress
-    local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
     
-    # Start rsync with simpler progress monitoring
-    echo "Starting rsync - this may take 10-30 minutes..."
+    # Run rsync with timeout and simplified monitoring
+    local rsync_pid
+    (
+        # Run rsync in background and capture its PID
+        timeout $RSYNC_TIMEOUT $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
+            tee "$rsync_stats" &
+        rsync_pid=$!
+        
+        # Simple progress indicator
+        while kill -0 $rsync_pid 2>/dev/null; do
+            local elapsed=$(($(date +%s) - start_time))
+            local minutes=$((elapsed / 60))
+            local seconds=$((elapsed % 60))
+            
+            # Show current extraction size
+            local current_size="0"
+            if [[ -d "$EXTRACT_DIR" ]]; then
+                current_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "0")
+            fi
+            
+            printf "\r${CYAN}Copying system files...${NC} [%02d:%02d] Size: %s     " \
+                "$minutes" "$seconds" "$current_size"
+            
+            sleep 5
+        done
+        
+        wait $rsync_pid
+        echo $? > "$WORKDIR/.rsync_exit_code"
+    ) &
     
-    # Run rsync and capture its exit status directly
-    if $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | tee "$stats_file"; then
-        local rsync_status=0
+    local monitor_pid=$!
+    
+    # Wait for the monitor process to complete
+    wait $monitor_pid
+    local overall_status=$?
+    
+    # Get the actual rsync exit code
+    local rsync_status=0
+    if [[ -f "$WORKDIR/.rsync_exit_code" ]]; then
+        rsync_status=$(cat "$WORKDIR/.rsync_exit_code")
     else
-        local rsync_status=$?
+        rsync_status=$overall_status
     fi
     
     echo "" # New line after progress
     
-    log_debug "Rsync completed with status: $rsync_status"
-    
     if [[ $rsync_status -eq 0 ]]; then
+        local elapsed=$(($(date +%s) - start_time))
+        local minutes=$((elapsed / 60))
+        local seconds=$((elapsed % 60))
+        
         # Parse final statistics
-        if [[ -f "$stats_file" ]]; then
-            local files_transferred=$(grep -E "Number of.*files transferred:" "$stats_file" | awk '{print $NF}' || echo "N/A")
-            local total_size=$(grep -E "Total file size:" "$stats_file" | awk '{print $4,$5}' || echo "N/A")
-            local transferred_size=$(grep -E "Total transferred file size:" "$stats_file" | awk '{print $5,$6}' || echo "N/A")
-            local speedup=$(grep -E "Speedup is" "$stats_file" | awk '{print $3}' || echo "N/A")
+        if [[ -f "$rsync_stats" ]]; then
+            local files_transferred=$(grep -E "Number of.*files transferred:" "$rsync_stats" | tail -1 | awk '{print $NF}' || echo "N/A")
+            local total_size=$(grep -E "Total file size:" "$rsync_stats" | tail -1 | awk '{print $4,$5}' || echo "N/A")
+            local transferred_size=$(grep -E "Total transferred file size:" "$rsync_stats" | tail -1 | awk '{print $5,$6}' || echo "N/A")
             
             echo ""
             log_success "System copy completed successfully!"
             echo ""
             echo -e "${BOLD}Copy Statistics:${NC}"
-            echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
-            echo -e "  ${CYAN}Total size:${NC}        $total_size"
-            echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
-            echo -e "  ${CYAN}Compression ratio:${NC} $speedup"
+            echo -e "  ${CYAN}Time taken:${NC}        ${minutes}m ${seconds}s"
+            echo -e "  ${CYAN}Files copied:${NC}       $files_transferred"
+            echo -e "  ${CYAN}Total size:${NC}         $total_size"
+            echo -e "  ${CYAN}Transferred:${NC}        $transferred_size"
             
             # Show actual copied size
             local copied_size
             copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
-            echo -e "  ${CYAN}Size on disk:${NC}      $copied_size"
+            echo -e "  ${CYAN}Size on disk:${NC}       $copied_size"
         fi
         
         save_state "rsync_complete"
@@ -1024,7 +825,14 @@ enhanced_rsync() {
     else
         log_error "System copy failed (exit code: $rsync_status)"
         echo ""
-        echo "Check the log file for details: $rsync_log"
+        log_info "Check the log files for details:"
+        log_info "  Main log: $rsync_log"
+        log_info "  Stats: $rsync_stats"
+        
+        if [[ $rsync_status -eq 124 ]]; then
+            log_error "Rsync timed out after $RSYNC_TIMEOUT seconds"
+        fi
+        
         return 1
     fi
 }
@@ -1058,8 +866,8 @@ post_copy_cleanup() {
 }
 
 clean_package_caches() {
-    $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb
-    $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"*
+    $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"* 2>/dev/null || true
 }
 
 clean_logs() {
@@ -1067,27 +875,27 @@ clean_logs() {
 }
 
 clean_temp() {
-    $SUDO rm -rf "$EXTRACT_DIR/tmp/"* "$EXTRACT_DIR/var/tmp/"*
+    $SUDO rm -rf "$EXTRACT_DIR/tmp/"* "$EXTRACT_DIR/var/tmp/"* 2>/dev/null || true
 }
 
 clean_ssh_keys() {
-    $SUDO rm -rf "$EXTRACT_DIR/etc/ssh/ssh_host_"*
-    $SUDO rm -rf "$EXTRACT_DIR/root/.ssh/"
+    $SUDO rm -rf "$EXTRACT_DIR/etc/ssh/ssh_host_"* 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/root/.ssh/" 2>/dev/null || true
 }
 
 clean_machine_ids() {
-    $SUDO rm -f "$EXTRACT_DIR/etc/machine-id"
-    $SUDO rm -f "$EXTRACT_DIR/var/lib/dbus/machine-id"
+    $SUDO rm -f "$EXTRACT_DIR/etc/machine-id" 2>/dev/null || true
+    $SUDO rm -f "$EXTRACT_DIR/var/lib/dbus/machine-id" 2>/dev/null || true
 }
 
 clean_kali_specific() {
     # Clean Kali-specific histories and caches
-    $SUDO rm -f "$EXTRACT_DIR/root/.zsh_history"
-    $SUDO rm -f "$EXTRACT_DIR/root/.bash_history"
-    $SUDO rm -rf "$EXTRACT_DIR/root/.cache/mozilla"
-    $SUDO rm -rf "$EXTRACT_DIR/root/.cache/chromium"
-    $SUDO rm -rf "$EXTRACT_DIR/root/.msf4/logs"
-    $SUDO rm -rf "$EXTRACT_DIR/var/lib/postgresql/*/main/pg_log/"*
+    $SUDO rm -f "$EXTRACT_DIR/root/.zsh_history" 2>/dev/null || true
+    $SUDO rm -f "$EXTRACT_DIR/root/.bash_history" 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/root/.cache/mozilla" 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/root/.cache/chromium" 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/root/.msf4/logs" 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/var/lib/postgresql/*/main/pg_log/"* 2>/dev/null || true
 }
 
 configure_chroot_enhanced() {
@@ -1114,8 +922,8 @@ configure_chroot_enhanced() {
     fi
     
     log_progress "Installing live system packages..."
-    if ! $SUDO chroot "$EXTRACT_DIR" /bin/bash /tmp/configure_system.sh; then
-        log_error "Chroot configuration failed"
+    if ! timeout 1800 $SUDO chroot "$EXTRACT_DIR" /bin/bash /tmp/configure_system.sh; then
+        log_error "Chroot configuration failed or timed out"
         return 1
     fi
     log_progress_done "Live system configured"
@@ -1161,7 +969,7 @@ export LANG=C.UTF-8
 echo "[CHROOT] Updating package database..."
 apt-get update || true
 
-# Essential packages
+# Essential packages for live system
 PACKAGES=(
     casper
     lupin-casper
@@ -1171,6 +979,8 @@ PACKAGES=(
     linux-generic
     net-tools
     network-manager
+    live-boot
+    live-boot-initramfs-tools
 )
 
 echo "[CHROOT] Installing packages..."
@@ -1246,6 +1056,7 @@ update-initramfs -u || update-initramfs -c -k all || true
 
 # Configure live-boot
 echo "[CHROOT] Configuring live-boot..."
+mkdir -p /etc/live
 cat > /etc/live/config.conf << EOF
 LIVE_HOSTNAME="kali"
 LIVE_USERNAME="kali"
@@ -1264,155 +1075,113 @@ CHROOT_SCRIPT
 }
 
 create_squashfs_enhanced() {
-    show_header "Creating SquashFS (${SCRIPT_STATE[compression_method]^^} compression)"
+    show_header "Creating SquashFS"
     
     local squashfs_file="$CDROOT_DIR/live/filesystem.squashfs"
     
+    # Calculate optimal parameters
+    local processors=$(nproc)
+    local available_mem=$(free -m | awk '/^Mem:/ {print $2}')
+    local mem_limit=$((available_mem / 2))
+    
+    # Ensure memory limit is reasonable
+    if [[ $mem_limit -lt 512 ]]; then
+        mem_limit=512
+    elif [[ $mem_limit -gt 4096 ]]; then
+        mem_limit=4096
+    fi
+    
     # Get source size for estimation
     log_info "Analyzing source data..."
-    local source_size_bytes
-    local du_output
-    du_output=$(du -sb "$EXTRACT_DIR" 2>/dev/null | cut -f1)
+    local source_size_kb
+    source_size_kb=$(safe_calculate_size "$EXTRACT_DIR")
     
-    # Validate it's a number
-    if [[ "$du_output" =~ ^[0-9]+$ ]]; then
-        source_size_bytes="$du_output"
-    else
-        source_size_bytes="0"
+    local source_size_human="N/A"
+    if [[ "$source_size_kb" -gt 0 ]]; then
+        source_size_human=$(numfmt --to=iec-i --suffix=B $((source_size_kb * 1024)) 2>/dev/null || echo "N/A")
     fi
     
-    local source_size_human
-    if [[ "$source_size_bytes" != "0" ]]; then
-        source_size_human=$(numfmt --to=iec-i --suffix=B "$source_size_bytes" 2>/dev/null || echo "N/A")
-        local source_size_gb=$((source_size_bytes / 1024 / 1024 / 1024))
-    else
-        source_size_human="N/A"
-        local source_size_gb=15
+    # Estimate compressed size (typically 40-50% of original)
+    local estimated_compressed_mb=0
+    if [[ "$source_size_kb" -gt 0 ]]; then
+        estimated_compressed_mb=$((source_size_kb / 1024 / 2))
     fi
-    
-    # Get estimated time
-    local system_specs
-    system_specs=$(detect_system_specs)
-    local estimated_time
-    estimated_time=$(estimate_compression_time "${SCRIPT_STATE[compression_method]}" "$source_size_gb" "$system_specs")
     
     log_info "Source size: $source_size_human"
-    log_info "Compression method: ${SCRIPT_STATE[compression_method]^^}"
-    log_info "Estimated time: ~${estimated_time} minutes"
-    
-    # Show compression-specific warnings
-    case "${SCRIPT_STATE[compression_method]}" in
-        "xz")
-            echo ""
-            log_warning "XZ compression is slow but provides excellent compression"
-            log_info "Consider using GZIP for faster builds in the future"
-            ;;
-        "lz4")
-            log_info "LZ4 compression prioritizes speed over size"
-            ;;
-        "gzip"|"gzip-9")
-            log_info "GZIP provides good balance of speed and compression"
-            ;;
-    esac
-    
+    log_info "Estimated compressed size: ~${estimated_compressed_mb}MB"
+    log_info "Using $processors CPU cores and ${mem_limit}MB memory"
     echo ""
     
-    # Get squashfs options
-    local squashfs_opts_str
-    squashfs_opts_str=$(get_squashfs_options)
-    local squashfs_opts
-    read -ra squashfs_opts <<< "$squashfs_opts_str"
+    local squashfs_opts=(
+        -no-exports
+        -noappend
+        -comp xz
+        -Xbcj x86
+        -b 1M
+        -processors "$processors"
+        -mem "${mem_limit}M"
+    )
     
     log_info "Creating compressed filesystem..."
-    log_info "This process cannot be easily interrupted - please be patient!"
+    log_info "This typically takes 5-20 minutes depending on system size and CPU."
     echo ""
     
-    # Run mksquashfs with enhanced progress parsing
+    # Run mksquashfs with timeout and simpler progress monitoring
     local start_time=$(date +%s)
-    local last_percent=0
-    local last_update=0
     
-    $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 | \
-        while IFS= read -r line; do
-            # Log all output to debug log
-            echo "$line" >&3
+    (
+        timeout 3600 $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 &
+        local mksquashfs_pid=$!
+        
+        # Simple progress monitor
+        while kill -0 $mksquashfs_pid 2>/dev/null; do
+            local elapsed=$(($(date +%s) - start_time))
+            local minutes=$((elapsed / 60))
+            local seconds=$((elapsed % 60))
             
-            # Parse progress
-            if [[ "$line" =~ ([0-9]+)% ]]; then
-                local percent="${BASH_REMATCH[1]}"
-                local current_time=$(date +%s)
-                
-                # Only update display every 2 seconds and when percentage changes
-                if [[ $percent -ne $last_percent ]] && [[ $((current_time - last_update)) -ge 2 ]]; then
-                    last_percent=$percent
-                    last_update=$current_time
-                    
-                    # Calculate ETA
-                    local elapsed=$((current_time - start_time))
-                    
-                    if [[ $percent -gt 0 && $elapsed -gt 0 ]]; then
-                        local total_time=$((elapsed * 100 / percent))
-                        local remaining=$((total_time - elapsed))
-                        local eta_min=$((remaining / 60))
-                        local eta_sec=$((remaining % 60))
-                        
-                        # Show progress bar
-                        printf "\r${CYAN}Compression:${NC} ["
-                        printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
-                        printf "] %3d%% " "$percent"
-                        
-                        if [[ $eta_min -gt 0 ]]; then
-                            printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
-                        else
-                            printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
-                        fi
-                    else
-                        printf "\r${CYAN}Compression:${NC} ["
-                        printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
-                        printf "] %3d%%     " "$percent"
-                    fi
-                fi
-            elif [[ "$line" =~ Writing ]]; then
-                printf "\r${CYAN}Writing filesystem metadata...${NC}                             "
-            elif [[ "$line" =~ Creating ]]; then
-                printf "\r${CYAN}Creating SquashFS structure...${NC}                             "
+            # Show current file size
+            local current_size="0"
+            if [[ -f "$squashfs_file" ]]; then
+                current_size=$(du -sh "$squashfs_file" 2>/dev/null | cut -f1 || echo "0")
             fi
+            
+            printf "\r${CYAN}Compressing filesystem...${NC} [%02d:%02d] Size: %s     " \
+                "$minutes" "$seconds" "$current_size"
+            
+            sleep 10
         done
+        
+        wait $mksquashfs_pid
+        echo $? > "$WORKDIR/.squashfs_exit_code"
+    ) &
     
-    local squashfs_status=$?
+    wait
+    
+    # Get exit code
+    local squashfs_status=0
+    if [[ -f "$WORKDIR/.squashfs_exit_code" ]]; then
+        squashfs_status=$(cat "$WORKDIR/.squashfs_exit_code")
+    fi
+    
     echo "" # New line after progress
     
-    if [[ $squashfs_status -eq 0 ]]; then
+    if [[ $squashfs_status -eq 0 ]] && [[ -f "$squashfs_file" ]]; then
         # Get final size and compression ratio
         local final_size_bytes
-        local stat_output
-        stat_output=$(stat -c%s "$squashfs_file" 2>/dev/null)
+        final_size_bytes=$(stat -c%s "$squashfs_file" 2>/dev/null || echo "0")
         
-        # Validate it's a number
-        if [[ "$stat_output" =~ ^[0-9]+$ ]]; then
-            final_size_bytes="$stat_output"
-        else
-            final_size_bytes="0"
-        fi
-        
-        local final_size_human
-        if [[ "$final_size_bytes" != "0" ]]; then
+        local final_size_human="N/A"
+        if [[ "$final_size_bytes" -gt 0 ]]; then
             final_size_human=$(numfmt --to=iec-i --suffix=B "$final_size_bytes" 2>/dev/null || echo "N/A")
-        else
-            final_size_human="N/A"
         fi
         
         local compression_ratio="N/A"
-        local space_saved="N/A"
-        if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$final_size_bytes" =~ ^[0-9]+$ ]] && 
-           [[ "$source_size_bytes" -gt 0 ]] && [[ "$final_size_bytes" -gt 0 ]]; then
-            compression_ratio=$(awk "BEGIN {printf \"%.1f:1\", $source_size_bytes / $final_size_bytes}")
-            if [[ "$source_size_bytes" -gt "$final_size_bytes" ]]; then
-                space_saved=$(numfmt --to=iec-i --suffix=B $((source_size_bytes - final_size_bytes)) 2>/dev/null || echo 'N/A')
+        if [[ "$source_size_kb" -gt 0 ]] && [[ "$final_size_bytes" -gt 0 ]]; then
+            local source_size_bytes=$((source_size_kb * 1024))
+            if command -v bc >/dev/null 2>&1; then
+                compression_ratio=$(echo "scale=1; $source_size_bytes / $final_size_bytes" | bc)":1"
             fi
         fi
-        
-        local actual_time=$((($(date +%s) - start_time) / 60))
         
         echo ""
         log_success "SquashFS created successfully!"
@@ -1421,22 +1190,13 @@ create_squashfs_enhanced() {
         echo -e "  ${CYAN}Original size:${NC}      $source_size_human"
         echo -e "  ${CYAN}Compressed size:${NC}    $final_size_human"
         echo -e "  ${CYAN}Compression ratio:${NC}  $compression_ratio"
-        echo -e "  ${CYAN}Space saved:${NC}        $space_saved"
-        echo -e "  ${CYAN}Actual time:${NC}        ${actual_time} minutes"
-        echo -e "  ${CYAN}Method used:${NC}        ${SCRIPT_STATE[compression_method]^^}"
         
         return 0
     else
         log_error "SquashFS creation failed"
-        
-        # Check for common issues
-        echo ""
-        log_info "Common solutions:"
-        echo "1. Check available disk space: df -h '$WORKDIR'"
-        echo "2. Try a different compression method (restart script)"
-        echo "3. Check system resources: top"
-        echo "4. Look at debug logs: tail '$WORKDIR/logs/debug-*.log'"
-        
+        if [[ $squashfs_status -eq 124 ]]; then
+            log_error "SquashFS creation timed out after 1 hour"
+        fi
         return 1
     fi
 }
@@ -1555,6 +1315,7 @@ setup_isolinux() {
         "/usr/lib/syslinux/modules/bios/ldlinux.c32"
         "/usr/lib/syslinux/modules/bios/libcom32.c32"
         "/usr/lib/syslinux/modules/bios/libutil.c32"
+        "/usr/lib/syslinux/modules/bios/menu.c32"
     )
     
     for file in "${isolinux_files[@]}"; do
@@ -1575,16 +1336,31 @@ setup_isolinux() {
 
 setup_isolinux_default() {
     $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null << 'EOF'
-DEFAULT live
+UI menu.c32
+PROMPT 0
+MENU TITLE AutoISO Live Boot Menu
 TIMEOUT 300
 
 LABEL live
+  MENU LABEL ^AutoISO Persistent Mode
+  MENU DEFAULT
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=casper persistent quiet splash ---
+
+LABEL live-safe
+  MENU LABEL AutoISO ^Safe Mode
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=casper persistent acpi=off noapic nomodeset quiet splash ---
+
+LABEL live-ram
+  MENU LABEL AutoISO to ^RAM
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd boot=casper persistent toram quiet splash ---
+
+LABEL live-nopersist
+  MENU LABEL AutoISO ^Live Mode (no persistence)
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd boot=casper quiet splash ---
-
-LABEL check
-  KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=casper integrity-check quiet splash ---
 EOF
 }
 
@@ -1609,12 +1385,12 @@ LABEL live-forensic
 LABEL live-persistence
   MENU LABEL ^Live USB Persistence
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components persistence persistence-encryption=luks quiet splash
+  APPEND initrd=/live/initrd boot=live components persistence quiet splash
 
 LABEL live-encrypted-persistence
   MENU LABEL ^Live USB Encrypted Persistence
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components persistent=cryptsetup persistence-encryption=luks quiet splash
+  APPEND initrd=/live/initrd boot=live components persistence persistence-encryption=luks quiet splash
 EOF
 }
 
@@ -1660,8 +1436,18 @@ setup_grub_default() {
 set timeout=30
 set default=0
 
-menuentry "Live System" {
+menuentry "AutoISO Persistent Mode" {
+    linux /live/vmlinuz boot=casper persistent quiet splash ---
+    initrd /live/initrd
+}
+
+menuentry "AutoISO Live Mode (no persistence)" {
     linux /live/vmlinuz boot=casper quiet splash ---
+    initrd /live/initrd
+}
+
+menuentry "AutoISO Safe Mode" {
+    linux /live/vmlinuz boot=casper persistent acpi=off noapic nomodeset quiet splash ---
     initrd /live/initrd
 }
 EOF
@@ -1683,7 +1469,7 @@ menuentry "Kali Live (forensic mode)" {
 }
 
 menuentry "Kali Live (persistence)" {
-    linux /live/vmlinuz boot=live components persistence persistence-encryption=luks quiet splash
+    linux /live/vmlinuz boot=live components persistence quiet splash
     initrd /live/initrd
 }
 EOF
@@ -1692,17 +1478,16 @@ EOF
 create_iso_metadata() {
     # Create filesystem.size
     local fs_size
-    fs_size=$(du -sx --block-size=1 "$EXTRACT_DIR" 2>/dev/null | cut -f1)
+    fs_size=$(safe_calculate_size "$EXTRACT_DIR")
     
-    # Validate it's a number
-    if [[ ! "$fs_size" =~ ^[0-9]+$ ]]; then
-        fs_size="0"
+    if [[ "$fs_size" -gt 0 ]]; then
+        echo "$((fs_size * 1024))" | $SUDO tee "$CDROOT_DIR/live/filesystem.size" >/dev/null
+    else
+        echo "0" | $SUDO tee "$CDROOT_DIR/live/filesystem.size" >/dev/null
     fi
     
-    echo "$fs_size" | $SUDO tee "$CDROOT_DIR/live/filesystem.size" >/dev/null
-    
     # Create manifest
-    $SUDO chroot "$EXTRACT_DIR" dpkg-query -W --showformat='${Package} ${Version}\n' | \
+    $SUDO chroot "$EXTRACT_DIR" dpkg-query -W --showformat='${Package} ${Version}\n' 2>/dev/null | \
         $SUDO tee "$CDROOT_DIR/live/filesystem.manifest" >/dev/null || true
     
     # Create .disk info
@@ -1742,22 +1527,12 @@ create_iso_enhanced() {
     
     # Calculate expected ISO size
     log_info "Calculating ISO size..."
-    local cdroot_size_bytes
-    local du_output
-    du_output=$(du -sb "$CDROOT_DIR" 2>/dev/null | cut -f1)
+    local cdroot_size_kb
+    cdroot_size_kb=$(safe_calculate_size "$CDROOT_DIR")
     
-    # Validate it's a number
-    if [[ "$du_output" =~ ^[0-9]+$ ]]; then
-        cdroot_size_bytes="$du_output"
-    else
-        cdroot_size_bytes="0"
-    fi
-    
-    local cdroot_size_human
-    if [[ "$cdroot_size_bytes" != "0" ]]; then
-        cdroot_size_human=$(numfmt --to=iec-i --suffix=B "$cdroot_size_bytes" 2>/dev/null || echo "N/A")
-    else
-        cdroot_size_human="N/A"
+    local cdroot_size_human="N/A"
+    if [[ "$cdroot_size_kb" -gt 0 ]]; then
+        cdroot_size_human=$(numfmt --to=iec-i --suffix=B $((cdroot_size_kb * 1024)) 2>/dev/null || echo "N/A")
     fi
     
     log_info "ISO content size: $cdroot_size_human"
@@ -1807,49 +1582,46 @@ create_iso_enhanced() {
         "$CDROOT_DIR"
     )
     
-    log_info "Building ISO image... This usually takes 1-3 minutes."
+    log_info "Building ISO image..."
+    log_info "This usually takes 1-5 minutes."
     echo ""
     
-    # Execute with cleaner progress monitoring
+    # Execute with timeout and simple progress monitoring
     local start_time=$(date +%s)
     local xorriso_output="$WORKDIR/logs/xorriso-output.log"
     
-    # Run xorriso and capture output
-    $SUDO "${xorriso_cmd[@]}" 2>&1 | tee "$xorriso_output" | \
-        grep -E "([0-9]+)(\.[0-9]+)?% done|Writing:|Finishing" | \
-        while IFS= read -r line; do
-            if [[ "$line" =~ ([0-9]+)(\.[0-9]+)?%[[:space:]]+done ]]; then
-                local percent="${BASH_REMATCH[1]}"
-                
-                # Calculate speed and ETA
-                local current_time=$(date +%s)
-                local elapsed=$((current_time - start_time))
-                
-                if [[ $percent -gt 0 && $elapsed -gt 0 ]]; then
-                    local total_time=$((elapsed * 100 / percent))
-                    local remaining=$((total_time - elapsed))
-                    
-                    # Show progress
-                    printf "\r${CYAN}Building ISO:${NC} ["
-                    printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
-                    printf "] %3d%% " "$percent"
-                    
-                    if [[ $remaining -gt 0 ]]; then
-                        printf "${CYAN}ETA:${NC} %ds     " "$remaining"
-                    fi
-                fi
-            elif [[ "$line" =~ Writing ]]; then
-                printf "\r${CYAN}Writing ISO metadata...${NC}                             "
-            elif [[ "$line" =~ Finishing ]]; then
-                printf "\r${CYAN}Finalizing ISO...${NC}                                  "
-            fi
+    # Run xorriso with timeout
+    (
+        timeout 1800 $SUDO "${xorriso_cmd[@]}" > "$xorriso_output" 2>&1 &
+        local xorriso_pid=$!
+        
+        # Simple progress monitor
+        while kill -0 $xorriso_pid 2>/dev/null; do
+            local elapsed=$(($(date +%s) - start_time))
+            local minutes=$((elapsed / 60))
+            local seconds=$((elapsed % 60))
+            
+            printf "\r${CYAN}Building ISO...${NC} [%02d:%02d]     " "$minutes" "$seconds"
+            sleep 2
         done
+        
+        wait $xorriso_pid
+        echo $? > "$WORKDIR/.xorriso_exit_code"
+    ) &
     
-    local iso_status=$?
+    wait
+    
+    # Get exit code
+    local iso_status=0
+    if [[ -f "$WORKDIR/.xorriso_exit_code" ]]; then
+        iso_status=$(cat "$WORKDIR/.xorriso_exit_code")
+    fi
+    
     echo "" # New line after progress
     
     if [[ $iso_status -ne 0 ]]; then
         log_error "ISO creation failed"
+        log_info "Check output: $xorriso_output"
         return 1
     fi
     
@@ -1863,7 +1635,7 @@ create_iso_enhanced() {
         fi
     fi
     
-    # Calculate checksums with progress
+    # Calculate checksums
     log_progress "Calculating checksums..."
     local checksum_file="$WORKDIR/checksums.txt"
     {
@@ -1872,43 +1644,28 @@ create_iso_enhanced() {
         echo ""
         
         # MD5
-        printf "Calculating MD5...   "
         local md5
         md5=$(md5sum "$iso_file" | cut -d' ' -f1)
-        echo "✓"
         echo "MD5:    $md5"
         
         # SHA256
-        printf "Calculating SHA256... "
         local sha256
         sha256=$(sha256sum "$iso_file" | cut -d' ' -f1)
-        echo "✓"
         echo "SHA256: $sha256"
         
         echo ""
         echo "Size: $(du -h "$iso_file" | cut -f1)"
-    } | tee "$checksum_file"
+    } > "$checksum_file"
     
-    echo ""
     log_progress_done "✓ Checksums calculated"
     
     # Get final ISO stats
     local iso_size_bytes
-    local stat_output
-    stat_output=$(stat -c%s "$iso_file" 2>/dev/null)
+    iso_size_bytes=$(stat -c%s "$iso_file" 2>/dev/null || echo "0")
     
-    # Validate it's a number
-    if [[ "$stat_output" =~ ^[0-9]+$ ]]; then
-        iso_size_bytes="$stat_output"
-    else
-        iso_size_bytes="0"
-    fi
-    
-    local iso_size_human
-    if [[ "$iso_size_bytes" != "0" ]]; then
+    local iso_size_human="N/A"
+    if [[ "$iso_size_bytes" -gt 0 ]]; then
         iso_size_human=$(numfmt --to=iec-i --suffix=B "$iso_size_bytes" 2>/dev/null || echo "N/A")
-    else
-        iso_size_human="N/A"
     fi
     
     # Save ISO path
@@ -1920,7 +1677,6 @@ create_iso_enhanced() {
     echo -e "${BOLD}ISO Information:${NC}"
     echo -e "  ${CYAN}File:${NC}         $(basename "$iso_file")"
     echo -e "  ${CYAN}Size:${NC}         $iso_size_human"
-    echo -e "  ${CYAN}Compression:${NC}  ${SCRIPT_STATE[compression_method]^^}"
     echo -e "  ${CYAN}Boot modes:${NC}   BIOS + UEFI"
     echo -e "  ${CYAN}USB bootable:${NC} Yes"
     
@@ -1968,8 +1724,8 @@ show_welcome() {
 EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
-    echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with smart compression${NC}"
-    echo -e "${GREEN}Now with intelligent compression selection and progress monitoring${NC}"
+    echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with enhanced reliability${NC}"
+    echo -e "${GREEN}Fixed rsync hanging and improved error handling${NC}"
     echo ""
 }
 
@@ -1994,13 +1750,8 @@ show_usage() {
     echo "  - Elementary OS"
     echo "  - Zorin OS"
     echo ""
-    echo "Compression Methods:"
-    echo "  - LZ4: Fastest compression (~2-5 minutes)"
-    echo "  - GZIP: Balanced speed/size (~5-15 minutes) [Default]"
-    echo "  - XZ: Maximum compression (~20+ minutes)"
-    echo ""
     echo "Examples:"
-    echo "  $0                           # Use default directory with interactive compression selection"
+    echo "  $0                           # Use default directory"
     echo "  $0 /home/user/iso-build     # Use custom directory"
     echo "  $0 -q /mnt/usb/build        # Quiet mode with USB drive"
     echo ""
@@ -2026,7 +1777,6 @@ show_summary() {
     fi
     
     echo -e "📁 ${BOLD}Work Directory:${NC} $WORKDIR"
-    echo -e "🗜️  ${BOLD}Compression:${NC} ${SCRIPT_STATE[compression_method]^^}"
     echo -e "🔐 ${BOLD}Checksums:${NC} $WORKDIR/checksums.txt"
     echo -e "📋 ${BOLD}Logs:${NC} $WORKDIR/logs/"
     echo -e "⏱️  ${BOLD}Build Time:${NC} ${minutes}m ${seconds}s"
@@ -2054,9 +1804,6 @@ check_resume_capability() {
         echo ""
         echo -e "${YELLOW}Previous build detected${NC}"
         echo "Stage: ${SCRIPT_STATE[stage]}"
-        if [[ -n "${SCRIPT_STATE[compression_method]}" ]]; then
-            echo "Compression: ${SCRIPT_STATE[compression_method]^^}"
-        fi
         echo ""
         echo "What would you like to do?"
         echo "1) Resume from last checkpoint"
@@ -2090,7 +1837,6 @@ main() {
     local resume_build=false
     if check_resume_capability; then
         resume_build=true
-        log_info "Resuming build from stage: ${SCRIPT_STATE[stage]}"
     fi
     
     # Run validation for new builds
@@ -2107,16 +1853,9 @@ main() {
         save_state "workspace_prepared"
     fi
     
-    # Choose compression method if not already set
-    if [[ -z "${SCRIPT_STATE[compression_method]}" ]]; then
-        choose_compression_method
-    else
-        log_info "Using compression method: ${SCRIPT_STATE[compression_method]^^}"
-    fi
-    
     # Execute build stages
     case "${SCRIPT_STATE[stage]}" in
-        "init"|"workspace_prepared"|"compression_selected")
+        "init"|"workspace_prepared")
             atomic_operation "system_copy" enhanced_rsync || exit 1
             ;&
         "atomic_system_copy_complete")
@@ -2160,8 +1899,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Now with intelligent compression selection and progress monitoring!"
-            echo "Supporting Ubuntu, Debian, Kali Linux, and derivatives"
+            echo "Fixed rsync hanging and improved reliability!"
             exit 0
             ;;
         -q|--quiet)
