@@ -803,7 +803,7 @@ enhanced_rsync() {
                 current_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "0")
             fi
             
-            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d Current size: %s Please wait...     " \
+            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d Current size: %s     " \
                 "$minutes" "$seconds" "$current_size"
             
             sleep 5
