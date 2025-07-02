@@ -707,11 +707,23 @@ enhanced_hybrid_copy() {
     log_info "Using hybrid approach: TAR for speed + rsync for verification"
     echo ""
     
-    # Stage 1: High-speed TAR copy
+    # Stage 1: High-speed TAR copy with performance monitoring
     log_info "Stage 1: High-speed TAR pipeline copy..."
+    local copy_start_time=$(date +%s)
+    
     if ! execute_tar_copy; then
-        log_warning "TAR copy failed, falling back to rsync..."
-        return execute_rsync_fallback
+        # Check if it was just slow vs actually failed
+        local elapsed=$(($(date +%s) - copy_start_time))
+        if [[ $elapsed -gt 300 ]]; then  # More than 5 minutes for initial stage
+            log_warning "TAR copy appears extremely slow, trying ultra-fast method..."
+            if ! execute_ultra_fast_copy; then
+                log_warning "Ultra-fast copy failed, falling back to rsync..."
+                return execute_rsync_fallback
+            fi
+        else
+            log_warning "TAR copy failed, falling back to rsync..."
+            return execute_rsync_fallback
+        fi
     fi
     
     # Stage 2: Rsync verification and gap-filling
@@ -775,22 +787,34 @@ execute_tar_copy() {
     
     log_info "Starting TAR pipeline (estimated: $total_size_human)..."
     
-    # Execute TAR with error handling
+    # Execute TAR with optimized options for speed
+    log_warning "Detected slow performance - trying optimized TAR options..."
+    
+    # Check available space and adjust strategy
+    local available_space_gb=$(df "$WORKDIR" | awk 'NR==2 {print int($4/1024/1024)}')
+    
+    if [[ $available_space_gb -lt 10 ]]; then
+        log_error "Less than 10GB available - this will be extremely slow"
+        log_info "Consider using a different location with more space"
+        return 1
+    fi
+    
+    # Optimized TAR options (remove problematic flags)
     if command -v pv >/dev/null 2>&1; then
-        # With progress monitoring
-        (cd / && $SUDO tar --numeric-owner --preserve-permissions --sparse \
+        # With progress monitoring but optimized
+        (cd / && $SUDO tar --numeric-owner --preserve-permissions \
             --ignore-failed-read "${tar_exclude_args[@]}" -cf - .) 2>"$tar_log" | \
-        pv -tpera -s "$total_size_bytes" -N "TAR Stage" | \
-        (cd "$EXTRACT_DIR" && $SUDO tar --numeric-owner --preserve-permissions --sparse -xf -)
+        pv -tpera -B 1M -N "TAR Stage" | \
+        (cd "$EXTRACT_DIR" && $SUDO tar --numeric-owner --preserve-permissions -xf -)
         
         local tar_status=${PIPESTATUS[0]}
         local extract_status=${PIPESTATUS[2]}
     else
-        # Without progress monitoring
-        log_warning "pv not available, using basic monitoring"
-        (cd / && $SUDO tar --numeric-owner --preserve-permissions --sparse \
+        # High-performance mode without progress monitoring
+        log_info "Using high-performance mode without progress monitoring"
+        (cd / && $SUDO tar --numeric-owner --preserve-permissions \
             --ignore-failed-read "${tar_exclude_args[@]}" -cf - .) 2>"$tar_log" | \
-        (cd "$EXTRACT_DIR" && $SUDO tar --numeric-owner --preserve-permissions --sparse -xf -)
+        (cd "$EXTRACT_DIR" && $SUDO tar --numeric-owner --preserve-permissions -xf -)
         
         local tar_status=${PIPESTATUS[0]}
         local extract_status=${PIPESTATUS[1]}
@@ -880,7 +904,47 @@ execute_rsync_verification() {
     fi
 }
 
-execute_rsync_fallback() {
+execute_ultra_fast_copy() {
+    log_warning "TAR is extremely slow - switching to ultra-fast cp method..."
+    
+    # Use cp with optimizations for maximum speed
+    local exclude_patterns=(
+        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
+        "/lost+found" "/.cache" "/var/cache" "/var/log/*.log"
+        "/var/lib/docker" "/snap" "/swapfile" "$WORKDIR"
+    )
+    
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        exclude_patterns+=(
+            "/root/.cache" "/root/.local/share/Trash"
+            "/opt/metasploit-framework/embedded/framework/.git"
+        )
+    fi
+    
+    # Build find exclusions
+    local find_exclude=""
+    for pattern in "${exclude_patterns[@]}"; do
+        find_exclude="$find_exclude -path $pattern -prune -o"
+    done
+    
+    log_info "Using high-speed cp method with find..."
+    
+    # Ultra-fast method: find + cp
+    (cd / && $SUDO find . -mount $find_exclude -type d -print0 | \
+     (cd "$EXTRACT_DIR" && $SUDO cpio -0pdm)) && \
+    (cd / && $SUDO find . -mount $find_exclude -type f -print0 | \
+     (cd "$EXTRACT_DIR" && $SUDO cpio -0pdm))
+    
+    local copy_status=$?
+    
+    if [[ $copy_status -eq 0 ]]; then
+        log_success "Ultra-fast copy completed successfully"
+        return 0
+    else
+        log_error "Ultra-fast copy failed"
+        return 1
+    fi
+}
     log_info "TAR failed - using reliable rsync fallback..."
     
     # Use enhanced rsync with better error tolerance
@@ -2095,8 +2159,29 @@ done
 # Set default work directory if not specified
 : "${WORKDIR:=$DEFAULT_WORKDIR}"
 
-# Resolve paths
+# Resolve and validate paths
 WORKDIR=$(realpath "$WORKDIR" 2>/dev/null || echo "$WORKDIR")
+
+# Critical: Prevent building in current directory or relative paths
+if [[ "$WORKDIR" == "$(pwd)/autoiso-build" ]] || [[ "$WORKDIR" =~ ^\./.*autoiso-build$ ]]; then
+    echo -e "${RED}ERROR: Cannot build in current directory!${NC}"
+    echo "This causes severe performance issues (like 58 KiB/sec)."
+    echo ""
+    echo "Use an absolute path instead:"
+    echo "  $0 /tmp/autoiso-build"
+    echo "  $0 /home/$USER/autoiso-build"
+    echo ""
+    exit 1
+fi
+
+# Ensure WORKDIR is absolute path
+if [[ ! "$WORKDIR" =~ ^/ ]]; then
+    echo -e "${RED}ERROR: Work directory must be absolute path!${NC}"
+    echo "Got: $WORKDIR"
+    echo "Use: $0 /tmp/autoiso-build"
+    exit 1
+fi
+
 EXTRACT_DIR="$WORKDIR/extract"
 CDROOT_DIR="$WORKDIR/cdroot"
 STATE_FILE="$WORKDIR/.autoiso-state"
