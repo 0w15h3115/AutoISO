@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Enhanced Rsync
-# Optimized for SMR drives and reliability
+# Enhanced AutoISO v3.1.2 - Professional Live ISO Creator with Enhanced Rsync
+# Optimized for reliability, performance, and user experience
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.3"
+readonly SCRIPT_VERSION="3.1.2"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -53,7 +53,7 @@ setup_logging() {
     exec 4>"$log_dir/error-$(date +%Y%m%d-%H%M%S).log"
     exec 5>"$log_dir/progress-$(date +%Y%m%d-%H%M%S).log"
     
-    log_info "AutoISO Enhanced v$SCRIPT_VERSION initialized (Rsync Optimized)"
+    log_info "AutoISO Enhanced v$SCRIPT_VERSION initialized"
     log_info "Process ID: $$"
     log_info "Work directory: $WORKDIR"
     log_info "System: $(uname -a)"
@@ -280,7 +280,6 @@ validate_system() {
         "Disk space:validate_space_detailed"
         "System health:validate_system_health"
         "Kernel files:validate_kernel_files"
-        "Storage performance:validate_storage_performance"
     )
     
     local errors=0
@@ -369,42 +368,6 @@ validate_required_tools() {
         log_error "Missing required packages: ${missing_packages[*]}"
         log_info "Install with: sudo apt-get install ${missing_packages[*]}"
         return 1
-    fi
-    
-    return 0
-}
-
-validate_storage_performance() {
-    log_info "Testing storage performance..."
-    
-    # Quick write test to detect SMR issues
-    local test_file="$WORKDIR/.speed_test"
-    mkdir -p "$WORKDIR"
-    
-    local start_time=$(date +%s)
-    if dd if=/dev/zero of="$test_file" bs=1M count=50 2>/dev/null; then
-        local end_time=$(date +%s)
-        local duration=$((end_time - start_time))
-        local speed_mbs=$((50 / duration))
-        
-        rm -f "$test_file"
-        
-        if [[ $speed_mbs -lt 5 ]]; then
-            log_warning "Storage speed is very slow: ${speed_mbs}MB/s"
-            log_warning "This may be an SMR drive or network storage"
-            log_info "Build will take significantly longer than normal"
-            echo ""
-            echo "Consider using:"
-            echo "  - Internal storage: /tmp/autoiso-build"
-            echo "  - Faster external drive (SSD preferred)"
-            echo ""
-            read -p "Continue anyway? (y/N): " -r continue_slow
-            [[ "$continue_slow" =~ ^[Yy]$ ]]
-        else
-            log_info "Storage speed: ${speed_mbs}MB/s (acceptable)"
-        fi
-    else
-        log_warning "Could not test storage performance"
     fi
     
     return 0
@@ -729,11 +692,11 @@ validate_kernel_files() {
 }
 
 # ========================================
-#    ENHANCED RSYNC COPY FUNCTION
+#    CORE BUILD FUNCTIONS
 # ========================================
 
-enhanced_rsync_copy() {
-    show_header "Enhanced Rsync Copy (SMR Optimized)"
+enhanced_rsync() {
+    show_header "System Copy"
     
     local rsync_log="$WORKDIR/logs/rsync.log"
     local rsync_partial_dir="$WORKDIR/.rsync-partial"
@@ -777,42 +740,36 @@ enhanced_rsync_copy() {
         )
     fi
     
-    # SMR-optimized rsync options
     local rsync_opts=(
-        -aAXHx                    # Archive mode with extended attributes and hard links
-        --partial                 # Keep partially transferred files
-        --partial-dir="$rsync_partial_dir"  # Directory for partial files
-        --numeric-ids             # Don't map uid/gid by name  
-        --one-file-system         # Don't cross filesystem boundaries
-        --log-file="$rsync_log"   # Log everything
-        --stats                   # Show statistics
-        --human-readable          # Human readable output
-        --inplace                 # Update files in-place (better for SMR)
-        --no-whole-file          # Use delta transfer algorithm
-        --compress-level=0        # No compression (faster for local)
-        --max-size=1G             # Skip files larger than 1GB (prevents huge file hangs)
-        --timeout=300             # 5 minute timeout per file
+        -aAXHx
+        --partial
+        --partial-dir="$rsync_partial_dir"
+        --numeric-ids
+        --one-file-system
+        --log-file="$rsync_log"
+        --stats
+        --human-readable
     )
     
     for pattern in "${exclude_patterns[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
-    log_info "Starting SMR-optimized rsync copy..."
-    log_info "This method is reliable for SMR drives and will show accurate progress."
+    log_info "Starting system copy... This may take 10-30 minutes depending on system size."
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
+    # Create a background process to monitor progress
+    local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
+    local rsync_pid
     
-    # Enhanced rsync with better progress monitoring and SMR handling
-    log_info "Copying filesystem (optimized for slow storage)..."
-    echo ""
-    
+    # Start rsync in background
     $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
-        tee -a "$rsync_log" | \
-        grep -E "to-check=|xfr#|speedup is|Number of files" | \
+        tee "$stats_file" | \
+        grep -E "to-check=|xfr#" | \
         while IFS= read -r line; do
+            # Parse rsync output for better progress display
             if [[ "$line" =~ to-check=([0-9]+)/([0-9]+) ]]; then
                 local remaining="${BASH_REMATCH[1]}"
                 local total="${BASH_REMATCH[2]}"
@@ -825,12 +782,9 @@ enhanced_rsync_copy() {
                 
                 if [[ $elapsed -gt 0 && $completed -gt 0 ]]; then
                     local rate=$((completed / elapsed))
-                    local eta_sec=0
-                    if [[ $rate -gt 0 ]]; then
-                        eta_sec=$((remaining / rate))
-                    fi
-                    local eta_min=$((eta_sec / 60))
-                    local eta_sec_remainder=$((eta_sec % 60))
+                    local eta=$((remaining / rate))
+                    local eta_min=$((eta / 60))
+                    local eta_sec=$((eta % 60))
                     
                     # Format the progress line
                     printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% " \
@@ -840,8 +794,8 @@ enhanced_rsync_copy() {
                     printf "${CYAN}Files:${NC} %d/%d " "$completed" "$total"
                     
                     if [[ $eta_min -gt 0 ]]; then
-                        printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec_remainder"
-                    elif [[ $eta_sec -gt 0 ]]; then
+                        printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
+                    else
                         printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
                     fi
                 fi
@@ -857,60 +811,61 @@ enhanced_rsync_copy() {
                     "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
                     "$percent" "$completed" "$total"
             fi
-        done
+        done &
     
+    # Wait for rsync to complete
+    wait
     local rsync_status=$?
+    
     echo "" # New line after progress
     
     if [[ $rsync_status -eq 0 ]]; then
         # Parse final statistics
-        if [[ -f "$rsync_log" ]]; then
-            local files_transferred=$(grep -E "Number of.*files transferred:" "$rsync_log" | awk '{print $NF}' || echo "N/A")
-            local total_size=$(grep -E "Total file size:" "$rsync_log" | awk '{print $4,$5}' || echo "N/A")
-            local transferred_size=$(grep -E "Total transferred file size:" "$rsync_log" | awk '{print $5,$6}' || echo "N/A")
-            local speedup=$(grep -E "Speedup is" "$rsync_log" | awk '{print $3}' || echo "N/A")
-            
-            # Calculate actual duration and speed
-            local end_time=$(date +%s)
-            local duration=$((end_time - start_time))
-            local minutes=$((duration / 60))
-            local seconds=$((duration % 60))
+        if [[ -f "$stats_file" ]]; then
+            local files_transferred=$(grep -E "Number of.*files transferred:" "$stats_file" | awk '{print $NF}' || echo "N/A")
+            local total_size=$(grep -E "Total file size:" "$stats_file" | awk '{print $4,$5}' || echo "N/A")
+            local transferred_size=$(grep -E "Total transferred file size:" "$stats_file" | awk '{print $5,$6}' || echo "N/A")
+            local speedup=$(grep -E "Speedup is" "$stats_file" | awk '{print $3}' || echo "N/A")
             
             echo ""
-            log_success "Rsync copy completed successfully!"
+            log_success "System copy completed successfully!"
             echo ""
             echo -e "${BOLD}Copy Statistics:${NC}"
             echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
             echo -e "  ${CYAN}Total size:${NC}        $total_size"
             echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
-            echo -e "  ${CYAN}Duration:${NC}          ${minutes}m ${seconds}s"
-            echo -e "  ${CYAN}Method:${NC}            Enhanced Rsync (SMR Optimized)"
+            echo -e "  ${CYAN}Compression ratio:${NC} $speedup"
             
             # Show actual copied size
             local copied_size
             copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
             echo -e "  ${CYAN}Size on disk:${NC}      $copied_size"
-            
-            # Calculate average speed
-            if [[ $duration -gt 0 ]]; then
-                local avg_speed_mb=$((df_output / 1024 / duration))
-                echo -e "  ${CYAN}Average speed:${NC}     ${avg_speed_mb}MB/s"
-            fi
         fi
         
         save_state "rsync_complete"
         return 0
     else
-        log_error "Rsync copy failed (exit code: $rsync_status)"
+        log_error "System copy failed (exit code: $rsync_status)"
         echo ""
         echo "Check the log file for details: $rsync_log"
         return 1
     fi
 }
 
-# ========================================
-#    POST-COPY CLEANUP (UNCHANGED)
-# ========================================
+# Helper function to format bytes to human readable
+format_bytes() {
+    local bytes=$1
+    local units=("B" "KB" "MB" "GB" "TB")
+    local unit=0
+    local size=$bytes
+    
+    while [[ $size -gt 1024 && $unit -lt 4 ]]; do
+        size=$((size / 1024))
+        ((unit++))
+    done
+    
+    echo "${size}${units[$unit]}"
+}
 
 post_copy_cleanup() {
     show_header "Post-Copy Optimization"
@@ -972,10 +927,6 @@ clean_kali_specific() {
     $SUDO rm -rf "$EXTRACT_DIR/root/.msf4/logs"
     $SUDO rm -rf "$EXTRACT_DIR/var/lib/postgresql/*/main/pg_log/"*
 }
-
-# ========================================
-#    CHROOT CONFIGURATION (UNCHANGED)
-# ========================================
 
 configure_chroot_enhanced() {
     show_header "Chroot Configuration"
@@ -1150,10 +1101,6 @@ CHROOT_SCRIPT
     $SUDO chmod +x "$script_path"
 }
 
-# ========================================
-#    SQUASHFS CREATION (UNCHANGED)
-# ========================================
-
 create_squashfs_enhanced() {
     show_header "Creating SquashFS"
     
@@ -1296,10 +1243,6 @@ create_squashfs_enhanced() {
         return 1
     fi
 }
-
-# ========================================
-#    BOOTLOADER SETUP (UNCHANGED)
-# ========================================
 
 setup_bootloader_enhanced() {
     show_header "Bootloader Setup"
@@ -1580,10 +1523,6 @@ create_iso_metadata() {
     return 0
 }
 
-# ========================================
-#    ISO CREATION (UNCHANGED)
-# ========================================
-
 create_iso_enhanced() {
     show_header "Creating ISO Image"
     
@@ -1831,8 +1770,8 @@ show_welcome() {
 EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
-    echo -e "${CYAN}🛡️ Enhanced Rsync: Reliable & SMR Optimized${NC}"
-    echo -e "${GREEN}Perfect for External Drives and Security Labs${NC}"
+    echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
+    echo -e "${GREEN}Now with improved error handling and number validation${NC}"
     echo ""
 }
 
@@ -1848,16 +1787,10 @@ show_usage() {
     echo "Arguments:"
     echo "  WORK_DIRECTORY    Directory for build files (default: $DEFAULT_WORKDIR)"
     echo ""
-    echo "SMR Drive Optimizations:"
-    echo "  - Enhanced Rsync:  Optimized for external/SMR drives"
-    echo "  - Resume Capable:  Can restart from interruptions"
-    echo "  - Progress Bars:   Real-time progress with ETA calculations"
-    echo "  - Storage Tests:   Automatic performance validation"
-    echo ""
     echo "Supported Distributions:"
     echo "  - Ubuntu and derivatives (Ubuntu, Kubuntu, Xubuntu, etc.)"
     echo "  - Debian"
-    echo "  - Kali Linux (optimized for security tools)"
+    echo "  - Kali Linux"
     echo "  - Linux Mint"
     echo "  - Pop!_OS"
     echo "  - Elementary OS"
@@ -1866,8 +1799,7 @@ show_usage() {
     echo "Examples:"
     echo "  $0                           # Use default directory"
     echo "  $0 /home/user/iso-build     # Use custom directory"
-    echo "  $0 /mnt                     # Use external drive"
-    echo "  $0 -q /tmp/build            # Quiet mode"
+    echo "  $0 -q /mnt/usb/build        # Quiet mode with USB drive"
     echo ""
 }
 
@@ -1878,8 +1810,7 @@ show_summary() {
     
     echo ""
     echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}${BOLD}        🛡️ RELIABLE ISO CREATION SUCCESSFUL! 🛡️${NC}"
-    echo -e "${GREEN}${BOLD}        (Enhanced Rsync - SMR Optimized)${NC}"
+    echo -e "${GREEN}${BOLD}        ✨ ISO CREATION SUCCESSFUL! ✨${NC}"
     echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
@@ -1895,24 +1826,6 @@ show_summary() {
     echo -e "🔐 ${BOLD}Checksums:${NC} $WORKDIR/checksums.txt"
     echo -e "📋 ${BOLD}Logs:${NC} $WORKDIR/logs/"
     echo -e "⏱️  ${BOLD}Build Time:${NC} ${minutes}m ${seconds}s"
-    echo -e "🛡️ ${BOLD}Method:${NC} Enhanced Rsync (SMR Compatible)"
-    
-    echo ""
-    echo -e "${CYAN}${BOLD}Features Used:${NC}"
-    echo "- SMR drive optimizations for better external drive performance"
-    echo "- Resume capability if interrupted"
-    echo "- Enhanced progress monitoring with transfer rates"
-    echo "- Comprehensive error logging for troubleshooting"
-    
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        echo ""
-        echo -e "${PURPLE}${BOLD}Kali-specific notes:${NC}"
-        echo "- Default username: kali"
-        echo "- Default password: kali"
-        echo "- For persistence, create a partition labeled 'persistence'"
-        echo "- All security tools and frameworks preserved"
-    fi
-    
     echo ""
     echo -e "${CYAN}${BOLD}Next Steps:${NC}"
     echo "1. Test in VirtualBox/VMware: Just boot the ISO directly"
@@ -1920,9 +1833,16 @@ show_summary() {
     echo "   ${BOLD}sudo dd if='${iso_path:-$WORKDIR/*.iso}' of=/dev/sdX bs=4M status=progress${NC}"
     echo "3. Or use GUI tools: Rufus (Windows), Etcher, or Ventoy"
     
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        echo ""
+        echo -e "${PURPLE}${BOLD}Kali-specific notes:${NC}"
+        echo "- Default username: kali"
+        echo "- Default password: kali"
+        echo "- For persistence, create a partition labeled 'persistence'"
+    fi
+    
     echo ""
-    echo -e "${GREEN}Thank you for using AutoISO Enhanced! 🎉🛡️${NC}"
-    echo -e "${CYAN}Reliable & SMR-Optimized for Security Analysts${NC}"
+    echo -e "${GREEN}Thank you for using AutoISO! 🎉${NC}"
 }
 
 check_resume_capability() {
@@ -1979,12 +1899,12 @@ main() {
         save_state "workspace_prepared"
     fi
     
-    # Execute build stages with enhanced rsync
+    # Execute build stages
     case "${SCRIPT_STATE[stage]}" in
         "init"|"workspace_prepared")
-            atomic_operation "system_copy" enhanced_rsync_copy || exit 1
+            atomic_operation "system_copy" enhanced_rsync || exit 1
             ;&
-        "atomic_system_copy_complete"|"rsync_complete")
+        "atomic_system_copy_complete")
             atomic_operation "post_cleanup" post_copy_cleanup || exit 1
             ;&
         "atomic_post_cleanup_complete")
@@ -2024,9 +1944,8 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -v|--version)
-            echo "Enhanced AutoISO v$SCRIPT_VERSION (SMR Optimized Rsync)"
-            echo "🛡️ Reliable & optimized for external drives"
-            echo "🚀 Perfect for Security Analysts with SMR drives"
+            echo "Enhanced AutoISO v$SCRIPT_VERSION"
+            echo "Now with improved kernel detection and Kali Linux support!"
             exit 0
             ;;
         -q|--quiet)
@@ -2052,29 +1971,8 @@ done
 # Set default work directory if not specified
 : "${WORKDIR:=$DEFAULT_WORKDIR}"
 
-# Resolve and validate paths
+# Resolve paths
 WORKDIR=$(realpath "$WORKDIR" 2>/dev/null || echo "$WORKDIR")
-
-# Critical: Prevent building in current directory or relative paths
-if [[ "$WORKDIR" == "$(pwd)/autoiso-build" ]] || [[ "$WORKDIR" =~ ^\./.*autoiso-build$ ]]; then
-    echo -e "${RED}ERROR: Cannot build in current directory!${NC}"
-    echo "This causes severe performance issues (like 58 KiB/sec)."
-    echo ""
-    echo "Use an absolute path instead:"
-    echo "  $0 /tmp/autoiso-build"
-    echo "  $0 /home/$USER/autoiso-build"
-    echo ""
-    exit 1
-fi
-
-# Ensure WORKDIR is absolute path
-if [[ ! "$WORKDIR" =~ ^/ ]]; then
-    echo -e "${RED}ERROR: Work directory must be absolute path!${NC}"
-    echo "Got: $WORKDIR"
-    echo "Use: $0 /tmp/autoiso-build"
-    exit 1
-fi
-
 EXTRACT_DIR="$WORKDIR/extract"
 CDROOT_DIR="$WORKDIR/cdroot"
 STATE_FILE="$WORKDIR/.autoiso-state"
