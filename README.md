@@ -50,7 +50,7 @@ chmod +x autoiso.sh
 
 2. Or clone the repository:
 ```bash
-git clone https://github.com/yourusername/autoiso.git
+git clone https://github.com/0w15h3115/autoiso.git
 cd autoiso
 chmod +x autoiso.sh
 ```
