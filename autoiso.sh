@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.2.1 - Professional Live ISO Creator with Hybrid TAR+Rsync
-# Combines TAR speed (3-4x faster) with rsync reliability verification
+# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Enhanced Rsync
+# Optimized for SMR drives and reliability
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.2.1"
+readonly SCRIPT_VERSION="3.1.3"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -53,7 +53,7 @@ setup_logging() {
     exec 4>"$log_dir/error-$(date +%Y%m%d-%H%M%S).log"
     exec 5>"$log_dir/progress-$(date +%Y%m%d-%H%M%S).log"
     
-    log_info "AutoISO Enhanced v$SCRIPT_VERSION initialized (Hybrid TAR+Rsync)"
+    log_info "AutoISO Enhanced v$SCRIPT_VERSION initialized (Rsync Optimized)"
     log_info "Process ID: $$"
     log_info "Work directory: $WORKDIR"
     log_info "System: $(uname -a)"
@@ -280,6 +280,7 @@ validate_system() {
         "Disk space:validate_space_detailed"
         "System health:validate_system_health"
         "Kernel files:validate_kernel_files"
+        "Storage performance:validate_storage_performance"
     )
     
     local errors=0
@@ -344,8 +345,6 @@ validate_distribution() {
 
 validate_required_tools() {
     local required_tools=(
-        "tar:tar"
-        "pv:pv"
         "rsync:rsync"
         "mksquashfs:squashfs-tools"
         "xorriso:xorriso"
@@ -370,6 +369,42 @@ validate_required_tools() {
         log_error "Missing required packages: ${missing_packages[*]}"
         log_info "Install with: sudo apt-get install ${missing_packages[*]}"
         return 1
+    fi
+    
+    return 0
+}
+
+validate_storage_performance() {
+    log_info "Testing storage performance..."
+    
+    # Quick write test to detect SMR issues
+    local test_file="$WORKDIR/.speed_test"
+    mkdir -p "$WORKDIR"
+    
+    local start_time=$(date +%s)
+    if dd if=/dev/zero of="$test_file" bs=1M count=50 2>/dev/null; then
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        local speed_mbs=$((50 / duration))
+        
+        rm -f "$test_file"
+        
+        if [[ $speed_mbs -lt 5 ]]; then
+            log_warning "Storage speed is very slow: ${speed_mbs}MB/s"
+            log_warning "This may be an SMR drive or network storage"
+            log_info "Build will take significantly longer than normal"
+            echo ""
+            echo "Consider using:"
+            echo "  - Internal storage: /tmp/autoiso-build"
+            echo "  - Faster external drive (SSD preferred)"
+            echo ""
+            read -p "Continue anyway? (y/N): " -r continue_slow
+            [[ "$continue_slow" =~ ^[Yy]$ ]]
+        else
+            log_info "Storage speed: ${speed_mbs}MB/s (acceptable)"
+        fi
+    else
+        log_warning "Could not test storage performance"
     fi
     
     return 0
@@ -694,314 +729,181 @@ validate_kernel_files() {
 }
 
 # ========================================
-#    ENHANCED HYBRID COPY FUNCTION
+#    ENHANCED RSYNC COPY FUNCTION
 # ========================================
 
-enhanced_hybrid_copy() {
-    show_header "Hybrid System Copy (TAR Speed + Rsync Reliability)"
+enhanced_rsync_copy() {
+    show_header "Enhanced Rsync Copy (SMR Optimized)"
     
-    local tar_log="$WORKDIR/logs/tar.log"
-    local rsync_log="$WORKDIR/logs/rsync-verify.log"
-    mkdir -p "$(dirname "$tar_log")"
+    local rsync_log="$WORKDIR/logs/rsync.log"
+    local rsync_partial_dir="$WORKDIR/.rsync-partial"
+    mkdir -p "$rsync_partial_dir"
     
-    log_info "Using hybrid approach: TAR for speed + rsync for verification"
-    echo ""
-    
-    # Stage 1: High-speed TAR copy with performance monitoring
-    log_info "Stage 1: High-speed TAR pipeline copy..."
-    local copy_start_time=$(date +%s)
-    
-    if ! execute_tar_copy; then
-        # Check if it was just slow vs actually failed
-        local elapsed=$(($(date +%s) - copy_start_time))
-        if [[ $elapsed -gt 300 ]]; then  # More than 5 minutes for initial stage
-            log_warning "TAR copy appears extremely slow, trying ultra-fast method..."
-            if ! execute_ultra_fast_copy; then
-                log_warning "Ultra-fast copy failed, falling back to rsync..."
-                return execute_rsync_fallback
-            fi
-        else
-            log_warning "TAR copy failed, falling back to rsync..."
-            return execute_rsync_fallback
-        fi
-    fi
-    
-    # Stage 2: Rsync verification and gap-filling
-    log_info "Stage 2: Rsync verification and gap-filling..."
-    if ! execute_rsync_verification; then
-        log_error "Verification failed - data integrity issues detected"
-        return 1
-    fi
-    
-    log_success "Hybrid copy completed successfully!"
-    return 0
-}
-
-execute_tar_copy() {
-    local start_time=$(date +%s)
-    
-    # Calculate estimated size for progress monitoring
+    # First, estimate the total size to copy
+    log_info "Calculating system size for accurate progress..."
     local total_size_bytes
+    local total_size_human
+    
+    # Get estimated size (this is fast) - ensure we get a valid number
     local df_output
     df_output=$(df / | awk 'NR==2 {print $3}' || echo "0")
     
+    # Validate it's a number
     if [[ "$df_output" =~ ^[0-9]+$ ]]; then
         total_size_bytes=$((df_output * 1024))
     else
-        total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB fallback
+        # Fallback to a reasonable estimate
+        total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB in bytes
     fi
     
-    local total_size_human
     total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
     
-    # Build exclusion patterns
+    log_info "Estimated data to copy: $total_size_human"
+    echo ""
+    
+    # Optimized exclusion list with Kali-specific additions
     local exclude_patterns=(
-        "dev/*" "proc/*" "sys/*" "tmp/*" "run/*" "mnt/*" "media/*"
-        "lost+found" ".cache" "var/cache/*" "var/log/*.log"
-        "var/lib/docker/*" "snap/*" "swapfile"
+        "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
+        "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
+        "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
     )
     
-    # Add work directory exclusion
-    local workdir_relative
-    workdir_relative=$(realpath --relative-to=/ "$WORKDIR" 2>/dev/null || echo "${WORKDIR#/}")
-    exclude_patterns+=("$workdir_relative" "$workdir_relative/*")
-    
-    # Add Kali-specific exclusions
+    # Add Kali-specific exclusions if needed
     if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
         exclude_patterns+=(
-            "root/.cache" "root/.local/share/Trash"
-            "opt/metasploit-framework/embedded/framework/.git"
+            "/root/.cache"
+            "/root/.local/share/Trash"
+            "/opt/metasploit-framework/embedded/framework/.git"
         )
     fi
     
-    # Build tar exclude arguments
-    local tar_exclude_args=()
-    for pattern in "${exclude_patterns[@]}"; do
-        tar_exclude_args+=(--exclude="$pattern")
-    done
-    
-    SCRIPT_STATE[cleanup_required]="true"
-    save_state "tar_copy_active"
-    
-    $SUDO mkdir -p "$EXTRACT_DIR"
-    
-    log_info "Starting TAR pipeline (estimated: $total_size_human)..."
-    
-    # Execute TAR with optimized options for speed
-    log_warning "Detected slow performance - trying optimized TAR options..."
-    
-    # Check available space and adjust strategy
-    local available_space_gb=$(df "$WORKDIR" | awk 'NR==2 {print int($4/1024/1024)}')
-    
-    if [[ $available_space_gb -lt 10 ]]; then
-        log_error "Less than 10GB available - this will be extremely slow"
-        log_info "Consider using a different location with more space"
-        return 1
-    fi
-    
-    # Optimized TAR options (remove problematic flags)
-    if command -v pv >/dev/null 2>&1; then
-        # With progress monitoring but optimized
-        (cd / && $SUDO tar --numeric-owner --preserve-permissions \
-            --ignore-failed-read "${tar_exclude_args[@]}" -cf - .) 2>"$tar_log" | \
-        pv -tpera -B 1M -N "TAR Stage" | \
-        (cd "$EXTRACT_DIR" && $SUDO tar --numeric-owner --preserve-permissions -xf -)
-        
-        local tar_status=${PIPESTATUS[0]}
-        local extract_status=${PIPESTATUS[2]}
-    else
-        # High-performance mode without progress monitoring
-        log_info "Using high-performance mode without progress monitoring"
-        (cd / && $SUDO tar --numeric-owner --preserve-permissions \
-            --ignore-failed-read "${tar_exclude_args[@]}" -cf - .) 2>"$tar_log" | \
-        (cd "$EXTRACT_DIR" && $SUDO tar --numeric-owner --preserve-permissions -xf -)
-        
-        local tar_status=${PIPESTATUS[0]}
-        local extract_status=${PIPESTATUS[1]}
-    fi
-    
-    echo ""
-    
-    # Check TAR results with tolerance for minor issues
-    if [[ $tar_status -eq 0 && $extract_status -eq 0 ]]; then
-        log_success "TAR copy completed successfully"
-        return 0
-    elif [[ $tar_status -eq 1 || $extract_status -eq 1 ]]; then
-        # Exit code 1 usually means "some files changed during copy" - acceptable
-        log_warning "TAR completed with warnings (some files changed during copy)"
-        return 0
-    else
-        log_error "TAR copy failed (tar: $tar_status, extract: $extract_status)"
-        return 1
-    fi
-}
-
-execute_rsync_verification() {
-    log_info "Verifying copy integrity with rsync..."
-    
-    # Build rsync options for verification
+    # SMR-optimized rsync options
     local rsync_opts=(
         -aAXHx                    # Archive mode with extended attributes and hard links
-        --numeric-ids             # Don't map uid/gid by name
-        --delete                  # Remove files not in source
-        --checksum               # Use checksums instead of time/size
-        --stats                  # Show statistics
-        --human-readable         # Human readable output
-        --log-file="$rsync_log"  # Log everything
+        --partial                 # Keep partially transferred files
+        --partial-dir="$rsync_partial_dir"  # Directory for partial files
+        --numeric-ids             # Don't map uid/gid by name  
+        --one-file-system         # Don't cross filesystem boundaries
+        --log-file="$rsync_log"   # Log everything
+        --stats                   # Show statistics
+        --human-readable          # Human readable output
+        --inplace                 # Update files in-place (better for SMR)
+        --no-whole-file          # Use delta transfer algorithm
+        --compress-level=0        # No compression (faster for local)
+        --max-size=1G             # Skip files larger than 1GB (prevents huge file hangs)
+        --timeout=300             # 5 minute timeout per file
     )
-    
-    # Build exclusion patterns (same as TAR)
-    local exclude_patterns=(
-        "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
-        "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
-        "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
-    )
-    
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        exclude_patterns+=(
-            "/root/.cache" "/root/.local/share/Trash"
-            "/opt/metasploit-framework/embedded/framework/.git"
-        )
-    fi
     
     for pattern in "${exclude_patterns[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
-    # Run rsync verification
+    log_info "Starting SMR-optimized rsync copy..."
+    log_info "This method is reliable for SMR drives and will show accurate progress."
+    SCRIPT_STATE[cleanup_required]="true"
+    save_state "rsync_active"
+    
     local start_time=$(date +%s)
     
-    log_info "Running integrity verification (this may take a few minutes)..."
-    $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
-        tee -a "$rsync_log" | \
-        grep -E "speedup is|Number of files|Total file size" || true
-    
-    local rsync_status=${PIPESTATUS[0]}
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
+    # Enhanced rsync with better progress monitoring and SMR handling
+    log_info "Copying filesystem (optimized for slow storage)..."
     echo ""
     
-    if [[ $rsync_status -eq 0 ]]; then
-        # Parse rsync statistics
-        local files_transferred=$(grep -E "Number of.*files transferred:" "$rsync_log" | awk '{print $NF}' || echo "0")
-        local speedup=$(grep -E "Speedup is" "$rsync_log" | awk '{print $3}' || echo "N/A")
-        
-        if [[ "$files_transferred" =~ ^[0-9]+$ ]] && [[ $files_transferred -eq 0 ]]; then
-            log_success "✓ Verification passed: No discrepancies found"
-            log_info "  Verification time: ${duration}s"
-            log_info "  Speedup ratio: $speedup"
-        else
-            log_warning "⚠ Verification found $files_transferred files to fix"
-            log_info "  Files were corrected by rsync"
-            log_info "  Verification time: ${duration}s"
-        fi
-        return 0
-    else
-        log_error "✗ Verification failed (exit code: $rsync_status)"
-        log_info "Check verification log: $rsync_log"
-        return 1
-    fi
-}
-
-execute_ultra_fast_copy() {
-    log_warning "TAR is extremely slow - switching to ultra-fast cp method..."
-    
-    # Use cp with optimizations for maximum speed
-    local exclude_patterns=(
-        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
-        "/lost+found" "/.cache" "/var/cache" "/var/log/*.log"
-        "/var/lib/docker" "/snap" "/swapfile" "$WORKDIR"
-    )
-    
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        exclude_patterns+=(
-            "/root/.cache" "/root/.local/share/Trash"
-            "/opt/metasploit-framework/embedded/framework/.git"
-        )
-    fi
-    
-    # Build find exclusions
-    local find_exclude=""
-    for pattern in "${exclude_patterns[@]}"; do
-        find_exclude="$find_exclude -path $pattern -prune -o"
-    done
-    
-    log_info "Using high-speed cp method with find..."
-    
-    # Ultra-fast method: find + cp
-    (cd / && $SUDO find . -mount $find_exclude -type d -print0 | \
-     (cd "$EXTRACT_DIR" && $SUDO cpio -0pdm)) && \
-    (cd / && $SUDO find . -mount $find_exclude -type f -print0 | \
-     (cd "$EXTRACT_DIR" && $SUDO cpio -0pdm))
-    
-    local copy_status=$?
-    
-    if [[ $copy_status -eq 0 ]]; then
-        log_success "Ultra-fast copy completed successfully"
-        return 0
-    else
-        log_error "Ultra-fast copy failed"
-        return 1
-    fi
-}
-    log_info "TAR failed - using reliable rsync fallback..."
-    
-    # Use enhanced rsync with better error tolerance
-    local rsync_opts=(
-        -aAXHx
-        --partial
-        --partial-dir="$WORKDIR/.rsync-partial"
-        --numeric-ids
-        --one-file-system
-        --log-file="$WORKDIR/logs/rsync-fallback.log"
-        --stats
-        --human-readable
-        --ignore-errors          # Continue on errors
-        --force                  # Force difficult deletions
-    )
-    
-    # Same exclusions as TAR
-    local exclude_patterns=(
-        "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
-        "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
-        "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
-    )
-    
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        exclude_patterns+=(
-            "/root/.cache" "/root/.local/share/Trash"
-            "/opt/metasploit-framework/embedded/framework/.git"
-        )
-    fi
-    
-    for pattern in "${exclude_patterns[@]}"; do
-        rsync_opts+=(--exclude="$pattern")
-    done
-    
-    log_info "Starting reliable rsync copy (may take longer but very reliable)..."
-    
     $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
-        grep -E "to-check=|speedup is" | \
+        tee -a "$rsync_log" | \
+        grep -E "to-check=|xfr#|speedup is|Number of files" | \
         while IFS= read -r line; do
             if [[ "$line" =~ to-check=([0-9]+)/([0-9]+) ]]; then
                 local remaining="${BASH_REMATCH[1]}"
                 local total="${BASH_REMATCH[2]}"
                 local completed=$((total - remaining))
                 local percent=$((completed * 100 / total))
-                printf "\r${CYAN}Rsync Fallback:${NC} [%-50s] %3d%% " \
-                    "$(printf '█%.0s' $(seq 1 $((percent / 2))))" "$percent"
+                
+                # Calculate speed and ETA
+                local current_time=$(date +%s)
+                local elapsed=$((current_time - start_time))
+                
+                if [[ $elapsed -gt 0 && $completed -gt 0 ]]; then
+                    local rate=$((completed / elapsed))
+                    local eta_sec=0
+                    if [[ $rate -gt 0 ]]; then
+                        eta_sec=$((remaining / rate))
+                    fi
+                    local eta_min=$((eta_sec / 60))
+                    local eta_sec_remainder=$((eta_sec % 60))
+                    
+                    # Format the progress line
+                    printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% " \
+                        "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
+                        "$percent"
+                    
+                    printf "${CYAN}Files:${NC} %d/%d " "$completed" "$total"
+                    
+                    if [[ $eta_min -gt 0 ]]; then
+                        printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec_remainder"
+                    elif [[ $eta_sec -gt 0 ]]; then
+                        printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
+                    fi
+                fi
+            elif [[ "$line" =~ xfr#([0-9]+),.*to-chk=([0-9]+)/([0-9]+) ]]; then
+                # Alternative parsing for different rsync versions
+                local transferred="${BASH_REMATCH[1]}"
+                local remaining="${BASH_REMATCH[2]}"
+                local total="${BASH_REMATCH[3]}"
+                local completed=$((total - remaining))
+                local percent=$((completed * 100 / total))
+                
+                printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% ${CYAN}Files:${NC} %d/%d     " \
+                    "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
+                    "$percent" "$completed" "$total"
             fi
         done
     
     local rsync_status=$?
-    echo ""
+    echo "" # New line after progress
     
     if [[ $rsync_status -eq 0 ]]; then
-        log_success "Rsync fallback completed successfully"
+        # Parse final statistics
+        if [[ -f "$rsync_log" ]]; then
+            local files_transferred=$(grep -E "Number of.*files transferred:" "$rsync_log" | awk '{print $NF}' || echo "N/A")
+            local total_size=$(grep -E "Total file size:" "$rsync_log" | awk '{print $4,$5}' || echo "N/A")
+            local transferred_size=$(grep -E "Total transferred file size:" "$rsync_log" | awk '{print $5,$6}' || echo "N/A")
+            local speedup=$(grep -E "Speedup is" "$rsync_log" | awk '{print $3}' || echo "N/A")
+            
+            # Calculate actual duration and speed
+            local end_time=$(date +%s)
+            local duration=$((end_time - start_time))
+            local minutes=$((duration / 60))
+            local seconds=$((duration % 60))
+            
+            echo ""
+            log_success "Rsync copy completed successfully!"
+            echo ""
+            echo -e "${BOLD}Copy Statistics:${NC}"
+            echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
+            echo -e "  ${CYAN}Total size:${NC}        $total_size"
+            echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
+            echo -e "  ${CYAN}Duration:${NC}          ${minutes}m ${seconds}s"
+            echo -e "  ${CYAN}Method:${NC}            Enhanced Rsync (SMR Optimized)"
+            
+            # Show actual copied size
+            local copied_size
+            copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
+            echo -e "  ${CYAN}Size on disk:${NC}      $copied_size"
+            
+            # Calculate average speed
+            if [[ $duration -gt 0 ]]; then
+                local avg_speed_mb=$((df_output / 1024 / duration))
+                echo -e "  ${CYAN}Average speed:${NC}     ${avg_speed_mb}MB/s"
+            fi
+        fi
+        
+        save_state "rsync_complete"
         return 0
     else
-        log_error "Rsync fallback failed (exit code: $rsync_status)"
+        log_error "Rsync copy failed (exit code: $rsync_status)"
+        echo ""
+        echo "Check the log file for details: $rsync_log"
         return 1
     fi
 }
@@ -1929,8 +1831,8 @@ show_welcome() {
 EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
-    echo -e "${CYAN}🚀 Hybrid TAR+Rsync: Speed + Reliability for Security Analysts${NC}"
-    echo -e "${GREEN}TAR Speed (3-4x faster) + Rsync Verification = Best of Both Worlds${NC}"
+    echo -e "${CYAN}🛡️ Enhanced Rsync: Reliable & SMR Optimized${NC}"
+    echo -e "${GREEN}Perfect for External Drives and Security Labs${NC}"
     echo ""
 }
 
@@ -1946,11 +1848,11 @@ show_usage() {
     echo "Arguments:"
     echo "  WORK_DIRECTORY    Directory for build files (default: $DEFAULT_WORKDIR)"
     echo ""
-    echo "Performance & Reliability Features:"
-    echo "  - Hybrid Pipeline: TAR speed (3-4x faster) + rsync verification"
-    echo "  - Data Integrity:  Checksum verification of all copied files"
+    echo "SMR Drive Optimizations:"
+    echo "  - Enhanced Rsync:  Optimized for external/SMR drives"
     echo "  - Resume Capable:  Can restart from interruptions"
-    echo "  - Error Recovery:  Automatic fallback to reliable rsync method"
+    echo "  - Progress Bars:   Real-time progress with ETA calculations"
+    echo "  - Storage Tests:   Automatic performance validation"
     echo ""
     echo "Supported Distributions:"
     echo "  - Ubuntu and derivatives (Ubuntu, Kubuntu, Xubuntu, etc.)"
@@ -1964,11 +1866,12 @@ show_usage() {
     echo "Examples:"
     echo "  $0                           # Use default directory"
     echo "  $0 /home/user/iso-build     # Use custom directory"
-    echo "  $0 -q /mnt/usb/build        # Quiet mode with USB drive"
+    echo "  $0 /mnt                     # Use external drive"
+    echo "  $0 -q /tmp/build            # Quiet mode"
     echo ""
 }
 
-show_reliability_summary() {
+show_summary() {
     local elapsed=$(($(date +%s) - ${SCRIPT_STATE[start_time]}))
     local minutes=$((elapsed / 60))
     local seconds=$((elapsed % 60))
@@ -1976,7 +1879,7 @@ show_reliability_summary() {
     echo ""
     echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${GREEN}${BOLD}        🛡️ RELIABLE ISO CREATION SUCCESSFUL! 🛡️${NC}"
-    echo -e "${GREEN}${BOLD}        (Hybrid TAR+Rsync Verification)${NC}"
+    echo -e "${GREEN}${BOLD}        (Enhanced Rsync - SMR Optimized)${NC}"
     echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     
@@ -1992,31 +1895,14 @@ show_reliability_summary() {
     echo -e "🔐 ${BOLD}Checksums:${NC} $WORKDIR/checksums.txt"
     echo -e "📋 ${BOLD}Logs:${NC} $WORKDIR/logs/"
     echo -e "⏱️  ${BOLD}Build Time:${NC} ${minutes}m ${seconds}s"
-    echo -e "🛡️ ${BOLD}Reliability:${NC} TAR Speed + Rsync Verification"
-    
-    # Show reliability report
-    echo ""
-    echo -e "${CYAN}${BOLD}Reliability Report:${NC}"
-    if [[ -f "$WORKDIR/logs/rsync-verify.log" ]]; then
-        local files_transferred=$(grep -E "Number of.*files transferred:" "$WORKDIR/logs/rsync-verify.log" | awk '{print $NF}' || echo "unknown")
-        if [[ "$files_transferred" =~ ^[0-9]+$ ]] && [[ $files_transferred -eq 0 ]]; then
-            echo -e "  ${GREEN}✓ Data Integrity: Perfect${NC}"
-            echo -e "  ${GREEN}✓ Verification: 0 discrepancies found${NC}"
-        else
-            echo -e "  ${YELLOW}⚠ Data Integrity: $files_transferred files corrected${NC}"
-            echo -e "  ${GREEN}✓ Verification: All issues resolved${NC}"
-        fi
-    else
-        echo -e "  ${YELLOW}⚠ Verification: Used rsync fallback method${NC}"
-        echo -e "  ${GREEN}✓ Data Integrity: Rsync built-in verification${NC}"
-    fi
+    echo -e "🛡️ ${BOLD}Method:${NC} Enhanced Rsync (SMR Compatible)"
     
     echo ""
-    echo -e "${CYAN}${BOLD}Security Features:${NC}"
-    echo "- Complete filesystem copy with permissions preserved"
-    echo "- Data integrity verification via checksumming"
+    echo -e "${CYAN}${BOLD}Features Used:${NC}"
+    echo "- SMR drive optimizations for better external drive performance"
     echo "- Resume capability if interrupted"
-    echo "- Comprehensive error logging for audit trails"
+    echo "- Enhanced progress monitoring with transfer rates"
+    echo "- Comprehensive error logging for troubleshooting"
     
     if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
         echo ""
@@ -2028,8 +1914,15 @@ show_reliability_summary() {
     fi
     
     echo ""
+    echo -e "${CYAN}${BOLD}Next Steps:${NC}"
+    echo "1. Test in VirtualBox/VMware: Just boot the ISO directly"
+    echo "2. Create bootable USB:"
+    echo "   ${BOLD}sudo dd if='${iso_path:-$WORKDIR/*.iso}' of=/dev/sdX bs=4M status=progress${NC}"
+    echo "3. Or use GUI tools: Rufus (Windows), Etcher, or Ventoy"
+    
+    echo ""
     echo -e "${GREEN}Thank you for using AutoISO Enhanced! 🎉🛡️${NC}"
-    echo -e "${CYAN}Speed + Security = Perfect for Security Analysts${NC}"
+    echo -e "${CYAN}Reliable & SMR-Optimized for Security Analysts${NC}"
 }
 
 check_resume_capability() {
@@ -2086,12 +1979,12 @@ main() {
         save_state "workspace_prepared"
     fi
     
-    # Execute build stages with hybrid approach
+    # Execute build stages with enhanced rsync
     case "${SCRIPT_STATE[stage]}" in
         "init"|"workspace_prepared")
-            atomic_operation "system_copy" enhanced_hybrid_copy || exit 1
+            atomic_operation "system_copy" enhanced_rsync_copy || exit 1
             ;&
-        "atomic_system_copy_complete"|"hybrid_copy_complete")
+        "atomic_system_copy_complete"|"rsync_complete")
             atomic_operation "post_cleanup" post_copy_cleanup || exit 1
             ;&
         "atomic_post_cleanup_complete")
@@ -2107,7 +2000,7 @@ main() {
             atomic_operation "iso_creation" create_iso_enhanced || exit 1
             ;&
         "atomic_iso_creation_complete")
-            show_reliability_summary
+            show_summary
             ;;
         *)
             log_error "Unknown state: ${SCRIPT_STATE[stage]}"
@@ -2131,9 +2024,9 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         -v|--version)
-            echo "Enhanced AutoISO v$SCRIPT_VERSION (Hybrid TAR+Rsync)"
-            echo "🚀 TAR Speed (3-4x faster) + Rsync Reliability"
-            echo "🛡️ Perfect for Security Analysts: Speed + Data Integrity"
+            echo "Enhanced AutoISO v$SCRIPT_VERSION (SMR Optimized Rsync)"
+            echo "🛡️ Reliable & optimized for external drives"
+            echo "🚀 Perfect for Security Analysts with SMR drives"
             exit 0
             ;;
         -q|--quiet)
