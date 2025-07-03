@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.4 - Professional Live ISO Creator with Kali Linux Support
-# Fixed SquashFS crashes on large filesystems and long operations
+# Enhanced AutoISO v3.1.5 - Professional Live ISO Creator with Kali Linux Support
+# Fixed SquashFS crashes and post-copy cleanup hanging on large filesystems
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.4"
+readonly SCRIPT_VERSION="3.1.5"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -718,6 +718,14 @@ validate_kernel_files() {
 #    CORE BUILD FUNCTIONS (FIXED RSYNC)
 # ========================================
 
+show_disk_activity() {
+    # Show disk I/O stats if available
+    if command -v iostat >/dev/null 2>&1; then
+        echo -n "  Disk activity: "
+        iostat -d 1 2 | tail -n 2 | head -n 1 | awk '{print "Read: " $3 " KB/s, Write: " $4 " KB/s"}' || echo "monitoring..."
+    fi
+}
+
 enhanced_rsync() {
     show_header "System Copy"
     
@@ -908,12 +916,33 @@ post_copy_cleanup() {
         cleanup_tasks+=("Kali histories:clean_kali_specific")
     fi
     
+    local task_count=0
+    local total_tasks=${#cleanup_tasks[@]}
+    
     for task in "${cleanup_tasks[@]}"; do
         local desc="${task%:*}"
         local func="${task#*:}"
-        log_progress "Cleaning $desc..."
-        $func
-        log_progress_done "Cleaned $desc"
+        ((task_count++))
+        
+        log_progress "Cleaning $desc... ($task_count/$total_tasks)"
+        echo "  This may take several minutes for large systems..."
+        
+        # Run cleanup with progress monitoring
+        local cleanup_start=$(date +%s)
+        
+        # Call the function directly with monitoring
+        if $func; then
+            local cleanup_duration=$(($(date +%s) - cleanup_start))
+            log_progress_done "Cleaned $desc (${cleanup_duration}s)"
+        else
+            log_warning "Error cleaning $desc"
+        fi
+        
+        # If any single cleanup task takes more than 5 minutes, warn the user
+        local elapsed=$(($(date +%s) - cleanup_start))
+        if [[ $elapsed -gt 300 ]]; then
+            log_warning "$desc took longer than expected (${elapsed}s)"
+        fi
     done
     
     log_success "Post-copy cleanup completed"
@@ -921,16 +950,48 @@ post_copy_cleanup() {
 }
 
 clean_package_caches() {
-    $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb
-    $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"*
+    # Count packages first (with timeout)
+    local deb_count=$(timeout 30 find "$EXTRACT_DIR/var/cache/apt/archives/" -name "*.deb" 2>/dev/null | wc -l || echo "0")
+    
+    if [[ $deb_count -gt 0 ]]; then
+        echo "    Removing $deb_count cached packages..."
+    fi
+    
+    # Use timeout for rm operations on potentially large directories
+    timeout 120 $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb || true
+    timeout 60 $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"* || true
 }
 
 clean_logs() {
-    $SUDO find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) -delete 2>/dev/null || true
+    # Count files first for progress indication (with timeout)
+    local log_count=$(timeout 30 find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) 2>/dev/null | wc -l || echo "0")
+    
+    if [[ $log_count -gt 0 ]]; then
+        echo "    Found $log_count log files to clean..."
+        
+        # Use faster method for many files
+        if [[ $log_count -gt 1000 ]]; then
+            # For many files, use a faster bulk method with timeout
+            timeout 300 bash -c "$SUDO find \"$EXTRACT_DIR/var/log\" -type f \( -name \"*.log\" -o -name \"*.gz\" \) -print0 2>/dev/null | xargs -0 -P 4 -n 100 rm -f" 2>/dev/null || true
+        else
+            # For fewer files, use the standard method with timeout
+            timeout 300 $SUDO find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) -delete 2>/dev/null || true
+        fi
+    else
+        echo "    No log files to clean or skipping due to timeout"
+    fi
 }
 
 clean_temp() {
-    $SUDO rm -rf "$EXTRACT_DIR/tmp/"* "$EXTRACT_DIR/var/tmp/"*
+    # Check size first to give user an idea of what's happening (with timeout)
+    local temp_size=$(timeout 30 du -sh "$EXTRACT_DIR/tmp/" "$EXTRACT_DIR/var/tmp/" 2>/dev/null | tail -n 1 | cut -f1 || echo "unknown")
+    if [[ "$temp_size" != "unknown" ]]; then
+        echo "    Cleaning temp files (total size: $temp_size)..."
+    fi
+    
+    # Use faster method with parallel processing for large directories (with timeout)
+    timeout 180 bash -c "$SUDO find \"$EXTRACT_DIR/tmp/\" -mindepth 1 -print0 2>/dev/null | xargs -0 -P 4 -n 50 rm -rf" 2>/dev/null || true
+    timeout 180 bash -c "$SUDO find \"$EXTRACT_DIR/var/tmp/\" -mindepth 1 -print0 2>/dev/null | xargs -0 -P 4 -n 50 rm -rf" 2>/dev/null || true
 }
 
 clean_ssh_keys() {
@@ -1932,7 +1993,19 @@ atomic_operation() {
     log_info "Starting: $operation_name"
     save_state "atomic_${operation_name}_start"
     
+    # Show transition message
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}Stage: ${BOLD}$operation_name${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
     local start_time=$(date +%s)
+    
+    # Add disk activity monitoring for operations that do heavy I/O
+    if [[ "$operation_name" =~ (system_copy|post_cleanup|squashfs) ]]; then
+        show_disk_activity
+    fi
     
     if $operation_function; then
         local duration=$(($(date +%s) - start_time))
@@ -1963,7 +2036,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Fixed SquashFS crashes on large filesystems${NC}"
+    echo -e "${GREEN}Fixed SquashFS crashes and cleanup hanging issues${NC}"
     echo ""
 }
 
@@ -2137,7 +2210,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Fixed SquashFS crashes and improved stability for large filesystems!"
+            echo "Fixed SquashFS crashes and cleanup hanging on large filesystems!"
             exit 0
             ;;
         -q|--quiet)
