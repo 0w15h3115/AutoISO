@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.5 - Professional Live ISO Creator with Kali Linux Support
-# Fixed SquashFS crashes and post-copy cleanup hanging on large filesystems
+# Enhanced AutoISO v3.2.0 - Professional Live ISO Creator with Mount Point Protection
+# Fixed to prevent copying mounted drives during system replication
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.5"
+readonly SCRIPT_VERSION="3.2.0"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -157,6 +157,124 @@ load_state() {
 }
 
 # ========================================
+#    MOUNT POINT DETECTION AND PROTECTION
+# ========================================
+
+# Get all mount points except special filesystems
+get_all_mount_points() {
+    # Get mount points, excluding special filesystems
+    mount | grep -E '^/dev/' | awk '{print $3}' | sort -r
+}
+
+# Get mount points that are subdirectories of a given path
+get_submounts() {
+    local base_path="$1"
+    local mount_point
+    
+    while IFS= read -r mount_point; do
+        # Skip the base path itself
+        if [[ "$mount_point" == "$base_path" ]]; then
+            continue
+        fi
+        
+        # Check if this mount point is under our base path
+        if [[ "$mount_point" == "$base_path"/* ]]; then
+            echo "$mount_point"
+        fi
+    done < <(get_all_mount_points)
+}
+
+# Build comprehensive exclusion list including all mount points
+build_exclude_list() {
+    local exclude_patterns=(
+        # Standard system exclusions
+        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
+        "/lost+found" "/.cache" "/var/cache/apt" "/var/log"
+        "/var/lib/docker" "/snap" "/swapfile" "$WORKDIR"
+        
+        # Additional safety exclusions
+        "/var/tmp" "/var/crash" "/var/backups"
+    )
+    
+    # Add all mount points that aren't the root filesystem
+    local mount_point
+    while IFS= read -r mount_point; do
+        if [[ "$mount_point" != "/" ]]; then
+            exclude_patterns+=("$mount_point")
+            log_debug "Excluding mount point: $mount_point"
+        fi
+    done < <(get_all_mount_points)
+    
+    # Add Kali-specific exclusions if needed
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        exclude_patterns+=(
+            "/root/.cache"
+            "/root/.local/share/Trash"
+            "/opt/metasploit-framework/embedded/framework/.git"
+        )
+    fi
+    
+    # Remove duplicates and sort
+    local unique_excludes=($(printf '%s\n' "${exclude_patterns[@]}" | sort -u))
+    
+    echo "${unique_excludes[@]}"
+}
+
+# Check if extract directory has any mounted filesystems
+check_extract_dir_mounts() {
+    local extract_dir="$1"
+    local has_mounts=false
+    local mount_point
+    
+    # Check if extract_dir itself is a mount point
+    if mountpoint -q "$extract_dir" 2>/dev/null; then
+        log_warning "$extract_dir is a mount point itself"
+    fi
+    
+    # Check for any mounts under extract_dir
+    local submounts=$(get_submounts "$extract_dir")
+    if [[ -n "$submounts" ]]; then
+        log_error "Found mounted filesystems under $extract_dir:"
+        echo "$submounts" | while read -r mount_point; do
+            log_error "  - $mount_point"
+        done
+        has_mounts=true
+    fi
+    
+    if [[ "$has_mounts" == "true" ]]; then
+        log_error "Cannot proceed with mounted filesystems in extract directory"
+        log_info "Please unmount them first or they will be included in the ISO"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validate extracted size is reasonable
+validate_extracted_size() {
+    local extract_dir="$1"
+    local max_reasonable_size_gb=100  # Adjust based on your needs
+    
+    local size_gb=$(du -sx "$extract_dir" 2>/dev/null | awk '{print int($1/1024/1024)}')
+    
+    if [[ $size_gb -gt $max_reasonable_size_gb ]]; then
+        log_warning "Extracted filesystem is ${size_gb}GB - larger than expected"
+        log_warning "This might indicate mounted filesystems were copied"
+        
+        # Show largest directories
+        log_info "Largest directories in extract:"
+        du -sh "$extract_dir"/* 2>/dev/null | sort -rh | head -10
+        
+        read -p "Continue anyway? (y/N): " -r continue_anyway
+        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# ========================================
 #    CLEANUP AND ERROR HANDLING
 # ========================================
 
@@ -295,6 +413,7 @@ validate_system() {
     local validation_steps=(
         "Distribution compatibility:validate_distribution"
         "Required tools:validate_required_tools"
+        "Mount points:validate_mount_points"
         "Disk space:validate_space_detailed"
         "System health:validate_system_health"
         "Kernel files:validate_kernel_files"
@@ -326,6 +445,50 @@ validate_system() {
     fi
     
     log_success "System validation completed successfully"
+    return 0
+}
+
+validate_mount_points() {
+    log_info "Detecting mounted filesystems..."
+    
+    # Show all mount points that will be excluded
+    local mount_points=($(get_all_mount_points))
+    local excluded_count=0
+    
+    echo ""
+    echo "Mounted filesystems detected:"
+    for mount_point in "${mount_points[@]}"; do
+        if [[ "$mount_point" == "/" ]]; then
+            echo "  $mount_point (root - will be copied)"
+        else
+            echo "  $mount_point (will be excluded)"
+            ((excluded_count++))
+        fi
+    done
+    
+    if [[ $excluded_count -gt 0 ]]; then
+        echo ""
+        log_info "Found $excluded_count mounted filesystem(s) that will be excluded from the ISO"
+        
+        # Check for large mounted drives
+        local large_mounts=()
+        for mount_point in "${mount_points[@]}"; do
+            if [[ "$mount_point" != "/" ]]; then
+                local size_gb=$(df "$mount_point" 2>/dev/null | awk 'NR==2 {print int($2/1024/1024)}' || echo "0")
+                if [[ $size_gb -gt 100 ]]; then
+                    large_mounts+=("$mount_point (${size_gb}GB)")
+                fi
+            fi
+        done
+        
+        if [[ ${#large_mounts[@]} -gt 0 ]]; then
+            log_warning "Large mounted drives detected that will be excluded:"
+            for mount in "${large_mounts[@]}"; do
+                echo "  - $mount"
+            done
+        fi
+    fi
+    
     return 0
 }
 
@@ -369,6 +532,7 @@ validate_required_tools() {
         "chroot:coreutils"
         "mount:mount"
         "umount:mount"
+        "mountpoint:util-linux"
     )
     
     local missing_packages=()
@@ -467,8 +631,8 @@ calculate_system_size_smart() {
     # Try multiple methods in order of accuracy
     local size_kb=0
     
-    # Method 1: Precise du calculation with timeout
-    if size_kb=$(calculate_size_du); then
+    # Method 1: Precise du calculation with mount exclusions
+    if size_kb=$(calculate_size_du_safe); then
         echo "$size_kb"
         return 0
     fi
@@ -487,30 +651,30 @@ calculate_system_size_smart() {
     fi
 }
 
-calculate_size_du() {
+calculate_size_du_safe() {
+    # Build exclude arguments from our comprehensive exclude list
     local exclude_args=()
-    local exclude_patterns=(
-        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
-        "/var/cache" "/var/log" "/var/tmp" "$WORKDIR"
-    )
+    local excludes=($(build_exclude_list))
     
-    for pattern in "${exclude_patterns[@]}"; do
+    for pattern in "${excludes[@]}"; do
         exclude_args+=(--exclude="$pattern")
     done
     
     local size_output
     # Add timeout to prevent hanging
     if command -v timeout >/dev/null 2>&1; then
-        size_output=$(timeout 60 du -sk "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
+        size_output=$(timeout 60 du -sx "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
     else
-        size_output=$(du -sk "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
+        size_output=$(du -sx "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
     fi
     
     # Ensure we have a valid number
     if [[ ! "$size_output" =~ ^[0-9]+$ ]]; then
         echo "0"
+        return 1
     else
         echo "$size_output"
+        return 0
     fi
 }
 
@@ -715,7 +879,7 @@ validate_kernel_files() {
 }
 
 # ========================================
-#    CORE BUILD FUNCTIONS (FIXED RSYNC)
+#    CORE BUILD FUNCTIONS (MOUNT-SAFE)
 # ========================================
 
 show_disk_activity() {
@@ -727,22 +891,28 @@ show_disk_activity() {
 }
 
 enhanced_rsync() {
-    show_header "System Copy"
+    show_header "System Copy (Mount-Safe)"
     
     local rsync_log="$WORKDIR/logs/rsync.log"
+    
+    # Build comprehensive exclusion list
+    log_info "Building exclusion list for mounted filesystems..."
+    local exclude_list=($(build_exclude_list))
+    
+    echo ""
+    log_info "Excluding ${#exclude_list[@]} paths from copy (including all mounted filesystems)"
     
     # First, estimate the total size to copy
     log_info "Calculating system size for accurate progress..."
     local total_size_bytes
     local total_size_human
     
-    # Get estimated size (this is fast) - ensure we get a valid number
-    local df_output
-    df_output=$(df / | awk 'NR==2 {print $3}' || echo "0")
+    # Get estimated size using our safe calculation
+    local system_size_kb=$(calculate_size_du_safe)
     
     # Validate it's a number
-    if [[ "$df_output" =~ ^[0-9]+$ ]]; then
-        total_size_bytes=$((df_output * 1024))
+    if [[ "$system_size_kb" =~ ^[0-9]+$ ]] && [[ $system_size_kb -gt 0 ]]; then
+        total_size_bytes=$((system_size_kb * 1024))
     else
         # Fallback to a reasonable estimate
         total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB in bytes
@@ -751,24 +921,21 @@ enhanced_rsync() {
     total_size_human=$(numfmt --to=si --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
     
     log_info "Estimated data to copy: $total_size_human"
-    echo ""
     
-    # Optimized exclusion list with Kali-specific additions
-    local exclude_patterns=(
-        "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
-        "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
-        "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
-    )
-    
-    # Add Kali-specific exclusions if needed
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        exclude_patterns+=(
-            "/root/.cache"
-            "/root/.local/share/Trash"
-            "/opt/metasploit-framework/embedded/framework/.git"
-        )
+    # Check if this seems reasonable
+    local size_gb=$((total_size_bytes / 1024 / 1024 / 1024))
+    if [[ $size_gb -gt 50 ]]; then
+        log_warning "System size appears large (${size_gb}GB)"
+        log_warning "This might indicate mounted filesystems are being included"
+        read -p "Continue with copy? (y/N): " -r continue_copy
+        if [[ ! "$continue_copy" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
     fi
     
+    echo ""
+    
+    # Build rsync options with all exclusions
     local rsync_opts=(
         -aHx
         --numeric-ids
@@ -776,34 +943,40 @@ enhanced_rsync() {
         --log-file="$rsync_log"
         --stats
         --human-readable
-        --whole-file
+        --info=progress2
     )
     
-    for pattern in "${exclude_patterns[@]}"; do
+    # Add all exclusions
+    for pattern in "${exclude_list[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
     log_info "Starting system copy... This may take 10-30 minutes depending on system size and disk speed."
+    log_info "Only copying the root filesystem - all other mounts are excluded"
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
-    # FIXED: Use simpler progress monitoring to prevent hanging
+    # Create exclude list file for debugging
+    printf '%s\n' "${exclude_list[@]}" > "$WORKDIR/exclude-list.txt"
+    log_debug "Exclude list saved to: $WORKDIR/exclude-list.txt"
+    
+    # MOUNT-SAFE: Use simpler progress monitoring
     local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
     
     # Start rsync with performance optimizations
-    log_info "Running rsync (optimized for speed)..."
+    log_info "Running rsync (mount-safe mode)..."
     echo ""
     
-    # Create a more robust rsync execution with proper signal handling
+    # Create a more robust rsync execution
     local rsync_pid
     local monitor_pid
     
-    # Start rsync in background without timeout interference
+    # Start rsync in background
     $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" > "$stats_file" 2>&1 &
     rsync_pid=$!
     
-    # Start a separate progress monitor (optimized for performance)
+    # Start a separate progress monitor
     (
         while kill -0 $rsync_pid 2>/dev/null; do
             local current_time=$(date +%s)
@@ -811,11 +984,13 @@ enhanced_rsync() {
             local minutes=$((elapsed / 60))
             local seconds=$((elapsed % 60))
             
-            # Show only time to avoid I/O contention with rsync
-            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d (rsync in progress)     " \
-                "$minutes" "$seconds"
+            # Check current size of extract dir
+            local current_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "calculating...")
             
-            sleep 15
+            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d Size: %s     " \
+                "$minutes" "$seconds" "$current_size"
+            
+            sleep 5
         done
     ) &
     monitor_pid=$!
@@ -828,28 +1003,32 @@ enhanced_rsync() {
     kill $monitor_pid 2>/dev/null || true
     wait $monitor_pid 2>/dev/null || true
     
-    # Store the actual rsync exit code
-    echo "$rsync_status" > "$WORKDIR/.rsync_exit_code"
-    
     echo "" # New line after progress
-    
-    # Get the actual rsync exit code
-    local rsync_status=0
-    if [[ -f "$WORKDIR/.rsync_exit_code" ]]; then
-        rsync_status=$(cat "$WORKDIR/.rsync_exit_code")
-    fi
     
     if [[ $rsync_status -eq 0 ]]; then
         local elapsed=$(($(date +%s) - start_time))
         local minutes=$((elapsed / 60))
         local seconds=$((elapsed % 60))
         
+        # Validate the extracted size
+        log_info "Validating extracted filesystem size..."
+        if ! validate_extracted_size "$EXTRACT_DIR"; then
+            log_error "Extracted size validation failed"
+            return 1
+        fi
+        
+        # Check for any mounted filesystems in extract
+        log_info "Checking for mounted filesystems in extract directory..."
+        if ! check_extract_dir_mounts "$EXTRACT_DIR"; then
+            log_error "Found mounted filesystems in extract directory"
+            return 1
+        fi
+        
         # Parse final statistics
         if [[ -f "$stats_file" ]]; then
             local files_transferred=$(grep -E "Number of.*files transferred:" "$stats_file" | awk '{print $NF}' || echo "N/A")
             local total_size=$(grep -E "Total file size:" "$stats_file" | awk '{print $4,$5}' || echo "N/A")
             local transferred_size=$(grep -E "Total transferred file size:" "$stats_file" | awk '{print $5,$6}' || echo "N/A")
-            local speedup=$(grep -E "Speedup is" "$stats_file" | awk '{print $3}' || echo "N/A")
             
             echo ""
             log_success "System copy completed successfully!"
@@ -859,12 +1038,12 @@ enhanced_rsync() {
             echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
             echo -e "  ${CYAN}Total size:${NC}        $total_size"
             echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
-            echo -e "  ${CYAN}Compression ratio:${NC} $speedup"
             
             # Show final copied size
             local copied_size
             copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
             echo -e "  ${CYAN}Final size on disk:${NC} $copied_size"
+            echo -e "  ${CYAN}Excluded mounts:${NC}    ${#exclude_list[@]} paths"
         fi
         
         save_state "rsync_complete"
@@ -872,15 +1051,9 @@ enhanced_rsync() {
     else
         log_error "System copy failed (exit code: $rsync_status)"
         echo ""
-        if [[ $rsync_status -eq 19 ]]; then
-            log_error "Rsync received SIGUSR1 signal - possibly interrupted"
-        elif [[ $rsync_status -eq 20 ]]; then
-            log_error "Rsync received termination signal (SIGINT/SIGTERM/SIGHUP)"
-        elif [[ $rsync_status -eq 23 ]]; then
-            log_error "Rsync partial transfer due to error"
-        fi
         echo "Check the log file for details: $rsync_log"
         echo "Check the stats file for details: $stats_file"
+        echo "Check excluded paths: $WORKDIR/exclude-list.txt"
         return 1
     fi
 }
@@ -902,6 +1075,13 @@ format_bytes() {
 
 post_copy_cleanup() {
     show_header "Post-Copy Optimization"
+    
+    # Extra safety check - ensure no mounts in extract
+    log_info "Final mount point check before cleanup..."
+    if ! check_extract_dir_mounts "$EXTRACT_DIR"; then
+        log_error "Cannot proceed - mounted filesystems detected"
+        return 1
+    fi
     
     local cleanup_tasks=(
         "Package caches:clean_package_caches"
@@ -925,7 +1105,6 @@ post_copy_cleanup() {
         ((task_count++))
         
         log_progress "Cleaning $desc... ($task_count/$total_tasks)"
-        echo "  This may take several minutes for large systems..."
         
         # Run cleanup with progress monitoring
         local cleanup_start=$(date +%s)
@@ -937,12 +1116,6 @@ post_copy_cleanup() {
         else
             log_warning "Error cleaning $desc"
         fi
-        
-        # If any single cleanup task takes more than 5 minutes, warn the user
-        local elapsed=$(($(date +%s) - cleanup_start))
-        if [[ $elapsed -gt 300 ]]; then
-            log_warning "$desc took longer than expected (${elapsed}s)"
-        fi
     done
     
     log_success "Post-copy cleanup completed"
@@ -950,48 +1123,23 @@ post_copy_cleanup() {
 }
 
 clean_package_caches() {
-    # Count packages first (with timeout)
-    local deb_count=$(timeout 30 find "$EXTRACT_DIR/var/cache/apt/archives/" -name "*.deb" 2>/dev/null | wc -l || echo "0")
-    
-    if [[ $deb_count -gt 0 ]]; then
-        echo "    Removing $deb_count cached packages..."
-    fi
-    
-    # Use timeout for rm operations on potentially large directories
-    timeout 120 $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb || true
-    timeout 60 $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"* || true
+    # Use faster, safer cleanup methods
+    $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"* 2>/dev/null || true
+    return 0
 }
 
 clean_logs() {
-    # Count files first for progress indication (with timeout)
-    local log_count=$(timeout 30 find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) 2>/dev/null | wc -l || echo "0")
-    
-    if [[ $log_count -gt 0 ]]; then
-        echo "    Found $log_count log files to clean..."
-        
-        # Use faster method for many files
-        if [[ $log_count -gt 1000 ]]; then
-            # For many files, use a faster bulk method with timeout
-            timeout 300 bash -c "$SUDO find \"$EXTRACT_DIR/var/log\" -type f \( -name \"*.log\" -o -name \"*.gz\" \) -print0 2>/dev/null | xargs -0 -P 4 -n 100 rm -f" 2>/dev/null || true
-        else
-            # For fewer files, use the standard method with timeout
-            timeout 300 $SUDO find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) -delete 2>/dev/null || true
-        fi
-    else
-        echo "    No log files to clean or skipping due to timeout"
-    fi
+    # Simple, fast log cleanup
+    $SUDO find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) -delete 2>/dev/null || true
+    return 0
 }
 
 clean_temp() {
-    # Check size first to give user an idea of what's happening (with timeout)
-    local temp_size=$(timeout 30 du -sh "$EXTRACT_DIR/tmp/" "$EXTRACT_DIR/var/tmp/" 2>/dev/null | tail -n 1 | cut -f1 || echo "unknown")
-    if [[ "$temp_size" != "unknown" ]]; then
-        echo "    Cleaning temp files (total size: $temp_size)..."
-    fi
-    
-    # Use faster method with parallel processing for large directories (with timeout)
-    timeout 180 bash -c "$SUDO find \"$EXTRACT_DIR/tmp/\" -mindepth 1 -print0 2>/dev/null | xargs -0 -P 4 -n 50 rm -rf" 2>/dev/null || true
-    timeout 180 bash -c "$SUDO find \"$EXTRACT_DIR/var/tmp/\" -mindepth 1 -print0 2>/dev/null | xargs -0 -P 4 -n 50 rm -rf" 2>/dev/null || true
+    # Fast temp cleanup
+    $SUDO rm -rf "$EXTRACT_DIR/tmp/"* 2>/dev/null || true
+    $SUDO rm -rf "$EXTRACT_DIR/var/tmp/"* 2>/dev/null || true
+    return 0
 }
 
 clean_ssh_keys() {
@@ -1188,11 +1336,18 @@ CHROOT_SCRIPT
 }
 
 # ========================================
-#    FIXED SQUASHFS FUNCTION
+#    MOUNT-SAFE SQUASHFS FUNCTION
 # ========================================
 
 create_squashfs_enhanced() {
-    show_header "Creating SquashFS"
+    show_header "Creating SquashFS (Mount-Safe)"
+    
+    # Final safety check before squashfs
+    log_info "Final safety check for mounted filesystems..."
+    if ! check_extract_dir_mounts "$EXTRACT_DIR"; then
+        log_error "Cannot create squashfs - mounted filesystems detected in extract"
+        return 1
+    fi
     
     local squashfs_file="$CDROOT_DIR/live/filesystem.squashfs"
     
@@ -1226,6 +1381,19 @@ create_squashfs_enhanced() {
         source_size_human=$(numfmt --to=iec-i --suffix=B "$source_size_bytes" 2>/dev/null || echo "N/A")
     else
         source_size_human="N/A"
+    fi
+    
+    # Final size check - if it's huge, something went wrong
+    local size_gb=$((source_size_bytes / 1024 / 1024 / 1024))
+    if [[ $size_gb -gt 50 ]]; then
+        log_error "Extract directory is ${size_gb}GB - this is unexpectedly large!"
+        log_error "This usually means mounted filesystems were included in the copy"
+        
+        # Show what's taking up space
+        log_info "Largest directories in extract:"
+        du -sh "$EXTRACT_DIR"/* 2>/dev/null | sort -rh | head -10
+        
+        return 1
     fi
     
     # Check if this is a large filesystem (>10GB)
@@ -2036,7 +2204,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Fixed SquashFS crashes and cleanup hanging issues${NC}"
+    echo -e "${GREEN}Mount-safe: Protects against copying mounted drives${NC}"
     echo ""
 }
 
@@ -2210,7 +2378,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Fixed SquashFS crashes and cleanup hanging on large filesystems!"
+            echo "Mount-safe version that prevents copying mounted drives!"
             exit 0
             ;;
         -q|--quiet)
