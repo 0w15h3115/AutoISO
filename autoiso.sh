@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Kali Linux Support
-# Fixed rsync hanging while preserving all original functionality
+# Enhanced AutoISO v3.1.4 - Professional Live ISO Creator with Kali Linux Support
+# Fixed SquashFS crashes on large filesystems and long operations
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.3"
+readonly SCRIPT_VERSION="3.1.4"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -170,6 +170,15 @@ cleanup_all() {
         kill -TERM $autoiso_pids 2>/dev/null || true
         sleep 2
         kill -9 $autoiso_pids 2>/dev/null || true
+    fi
+    
+    # Kill any mksquashfs processes that might be hanging
+    local squashfs_pids=$(pgrep -f "mksquashfs" || true)
+    if [[ -n "$squashfs_pids" ]]; then
+        log_debug "Cleaning up squashfs processes: $squashfs_pids"
+        $SUDO kill -TERM $squashfs_pids 2>/dev/null || true
+        sleep 2
+        $SUDO kill -9 $squashfs_pids 2>/dev/null || true
     fi
     
     # Show cleanup progress
@@ -1117,14 +1126,26 @@ CHROOT_SCRIPT
     $SUDO chmod +x "$script_path"
 }
 
+# ========================================
+#    FIXED SQUASHFS FUNCTION
+# ========================================
+
 create_squashfs_enhanced() {
     show_header "Creating SquashFS"
     
     local squashfs_file="$CDROOT_DIR/live/filesystem.squashfs"
     
-    # Calculate optimal parameters
+    # Calculate optimal parameters with memory safety
     local processors=$(nproc)
-    local mem_limit=$(($(free -m | awk '/^Mem:/ {print $2}') / 2))
+    local available_mem_mb=$(free -m | awk '/^Mem:/ {print $2}')
+    local mem_limit=$((available_mem_mb / 4))  # Use only 25% of RAM for safety
+    
+    # Minimum 512MB, maximum 4GB for mksquashfs
+    if [[ $mem_limit -lt 512 ]]; then
+        mem_limit=512
+    elif [[ $mem_limit -gt 4096 ]]; then
+        mem_limit=4096
+    fi
     
     # Get source size for estimation
     log_info "Analyzing source data..."
@@ -1146,6 +1167,13 @@ create_squashfs_enhanced() {
         source_size_human="N/A"
     fi
     
+    # Check if this is a large filesystem (>10GB)
+    local is_large_fs=false
+    if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$source_size_bytes" -gt $((10 * 1024 * 1024 * 1024)) ]]; then
+        is_large_fs=true
+        log_warning "Large filesystem detected (>10GB). Using optimized settings."
+    fi
+    
     # Estimate compressed size (typically 40-50% of original)
     local estimated_compressed=0
     if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$source_size_bytes" -gt 0 ]]; then
@@ -1154,65 +1182,181 @@ create_squashfs_enhanced() {
     
     log_info "Source size: $source_size_human"
     log_info "Estimated compressed size: ~${estimated_compressed}MB"
-    log_info "Using $processors CPU cores and ${mem_limit}MB memory"
+    log_info "Using $processors CPU cores and ${mem_limit}MB memory limit"
+    
+    # Check available memory before starting
+    local free_mem_mb=$(free -m | awk '/^Mem:/ {print $4}')
+    if [[ $free_mem_mb -lt 1024 ]]; then
+        log_warning "Low memory available: ${free_mem_mb}MB free"
+        log_info "Consider closing other applications or using a system with more RAM"
+    fi
+    
     echo ""
+    
+    # Choose compression based on filesystem size
+    local compression_method="xz"
+    local compression_opts=()
+    
+    if [[ "$is_large_fs" == "true" ]]; then
+        # For large filesystems, use gzip for better stability
+        compression_method="gzip"
+        compression_opts=(-comp gzip -Xcompression-level 6)
+        log_info "Using gzip compression for stability on large filesystem"
+    else
+        # For smaller filesystems, use XZ with careful settings
+        compression_opts=(-comp xz -Xbcj x86 -Xdict-size 100%)
+        log_info "Using XZ compression for better ratio on smaller filesystem"
+    fi
     
     local squashfs_opts=(
         -no-exports
         -noappend
-        -comp xz
-        -Xbcj x86
+        "${compression_opts[@]}"
         -b 1M
         -processors "$processors"
         -mem "${mem_limit}M"
     )
     
-    log_info "Creating compressed filesystem... This typically takes 5-15 minutes."
+    log_info "Creating compressed filesystem... This may take 5-30 minutes depending on size."
     echo ""
     
-    # Run mksquashfs with progress parsing
-    local start_time=$(date +%s)
-    local last_percent=0
+    # Create a status file for monitoring
+    local status_file="$WORKDIR/.squashfs_status"
+    local progress_file="$WORKDIR/.squashfs_progress"
+    echo "0" > "$progress_file"
     
-    $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 | \
+    # Save diagnostic info
+    cat > "$WORKDIR/.squashfs_diagnostic" << EOF
+SOURCE_SIZE: $source_size_human
+SOURCE_PATH: $EXTRACT_DIR
+DESTINATION: $squashfs_file
+COMPRESSION: $compression_method
+PROCESSORS: $processors
+MEMORY_LIMIT: ${mem_limit}MB
+AVAILABLE_MEM: ${free_mem_mb}MB
+STARTED: $(date)
+OPTIONS: ${squashfs_opts[@]}
+EOF
+    
+    # Start mksquashfs with better error handling
+    local start_time=$(date +%s)
+    local squashfs_log="$WORKDIR/logs/squashfs.log"
+    local squashfs_pid
+    local monitor_pid
+    
+    # Run mksquashfs in background with full logging
+    (
+        $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 | \
+        tee "$squashfs_log" | \
         grep -E "[0-9]+%" | \
         while IFS= read -r line; do
             if [[ "$line" =~ ([0-9]+)% ]]; then
-                local percent="${BASH_REMATCH[1]}"
-                
-                # Only update if percentage changed
-                if [[ $percent -ne $last_percent ]]; then
-                    last_percent=$percent
-                    
-                    # Calculate ETA
-                    local current_time=$(date +%s)
-                    local elapsed=$((current_time - start_time))
-                    
-                    if [[ $percent -gt 0 && $elapsed -gt 0 ]]; then
-                        local total_time=$((elapsed * 100 / percent))
-                        local remaining=$((total_time - elapsed))
-                        local eta_min=$((remaining / 60))
-                        local eta_sec=$((remaining % 60))
-                        
-                        # Show progress bar
-                        printf "\r${CYAN}Compression:${NC} ["
-                        printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
-                        printf "] %3d%% " "$percent"
-                        
-                        if [[ $eta_min -gt 0 ]]; then
-                            printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
-                        else
-                            printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
-                        fi
-                    fi
-                fi
+                echo "${BASH_REMATCH[1]}" > "$progress_file"
             fi
         done
+        echo $? > "$status_file"
+    ) &
+    squashfs_pid=$!
     
-    local squashfs_status=$?
+    # Monitor progress with timeout protection
+    local timeout_minutes=120  # 2 hour timeout for very large filesystems
+    local timeout_seconds=$((timeout_minutes * 60))
+    local last_progress=0
+    local stall_count=0
+    local max_stalls=20  # Allow up to 20 checks without progress (5 minutes)
+    
+    (
+        while kill -0 $squashfs_pid 2>/dev/null; do
+            local current_time=$(date +%s)
+            local elapsed=$((current_time - start_time))
+            
+            # Check for timeout
+            if [[ $elapsed -gt $timeout_seconds ]]; then
+                log_error "SquashFS creation timed out after ${timeout_minutes} minutes"
+                $SUDO kill -TERM $squashfs_pid 2>/dev/null || true
+                sleep 5
+                $SUDO kill -9 $squashfs_pid 2>/dev/null || true
+                break
+            fi
+            
+            # Read current progress
+            local current_progress=$(cat "$progress_file" 2>/dev/null || echo "0")
+            
+            # Check for stalls
+            if [[ "$current_progress" == "$last_progress" ]]; then
+                ((stall_count++))
+                if [[ $stall_count -gt $max_stalls ]]; then
+                    log_error "SquashFS appears to be stalled (no progress for 5 minutes)"
+                    # Save diagnostic info
+                    echo "STALLED at ${current_progress}% after ${elapsed}s" >> "$WORKDIR/.squashfs_diagnostic"
+                    ps aux | grep -E "(mksquashfs|xz)" >> "$WORKDIR/.squashfs_diagnostic"
+                    free -m >> "$WORKDIR/.squashfs_diagnostic"
+                    
+                    $SUDO kill -TERM $squashfs_pid 2>/dev/null || true
+                    sleep 5
+                    $SUDO kill -9 $squashfs_pid 2>/dev/null || true
+                    break
+                fi
+            else
+                stall_count=0
+                last_progress=$current_progress
+            fi
+            
+            # Calculate ETA
+            if [[ $current_progress -gt 0 ]]; then
+                local total_time=$((elapsed * 100 / current_progress))
+                local remaining=$((total_time - elapsed))
+                local eta_min=$((remaining / 60))
+                local eta_sec=$((remaining % 60))
+                
+                # Show progress
+                printf "\r${CYAN}Compression:${NC} ["
+                printf "%-50s" "$(printf '█%.0s' $(seq 1 $((current_progress / 2))))"
+                printf "] %3d%% " "$current_progress"
+                
+                if [[ $eta_min -gt 0 ]]; then
+                    printf "${CYAN}ETA:${NC} %dm %ds " "$eta_min" "$eta_sec"
+                else
+                    printf "${CYAN}ETA:${NC} %ds " "$eta_sec"
+                fi
+                
+                # Show memory usage
+                local mem_used=$(ps aux | grep -E "mksquashfs.*$squashfs_file" | awk '{sum+=$6} END {print int(sum/1024)}' || echo "0")
+                if [[ $mem_used -gt 0 ]]; then
+                    printf "${CYAN}Mem:${NC} %dMB     " "$mem_used"
+                fi
+            else
+                local minutes=$((elapsed / 60))
+                local seconds=$((elapsed % 60))
+                printf "\r${CYAN}Initializing compression...${NC} Time: %02d:%02d     " "$minutes" "$seconds"
+            fi
+            
+            sleep 15
+        done
+    ) &
+    monitor_pid=$!
+    
+    # Wait for squashfs to complete
+    wait $squashfs_pid
+    local wait_status=$?
+    
+    # Kill monitor
+    kill $monitor_pid 2>/dev/null || true
+    wait $monitor_pid 2>/dev/null || true
+    
     echo "" # New line after progress
     
-    if [[ $squashfs_status -eq 0 ]]; then
+    # Get actual exit status
+    local squashfs_status=$wait_status
+    if [[ -f "$status_file" ]]; then
+        squashfs_status=$(cat "$status_file")
+    fi
+    
+    # Update diagnostic file
+    echo "ENDED: $(date)" >> "$WORKDIR/.squashfs_diagnostic"
+    echo "EXIT_CODE: $squashfs_status" >> "$WORKDIR/.squashfs_diagnostic"
+    
+    if [[ $squashfs_status -eq 0 ]] && [[ -f "$squashfs_file" ]]; then
         # Get final size and compression ratio
         local final_size_bytes
         local stat_output
@@ -1238,24 +1382,56 @@ create_squashfs_enhanced() {
             compression_ratio=$(awk "BEGIN {printf \"%.1f:1\", $source_size_bytes / $final_size_bytes}")
         fi
         
+        local elapsed=$(($(date +%s) - start_time))
+        local minutes=$((elapsed / 60))
+        local seconds=$((elapsed % 60))
+        
         echo ""
         log_success "SquashFS created successfully!"
         echo ""
         echo -e "${BOLD}Compression Statistics:${NC}"
+        echo -e "  ${CYAN}Time taken:${NC}         ${minutes}m ${seconds}s"
         echo -e "  ${CYAN}Original size:${NC}      $source_size_human"
         echo -e "  ${CYAN}Compressed size:${NC}    $final_size_human"
         echo -e "  ${CYAN}Compression ratio:${NC}  $compression_ratio"
+        echo -e "  ${CYAN}Compression type:${NC}   $compression_method"
         
         if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$final_size_bytes" =~ ^[0-9]+$ ]] && 
            [[ "$source_size_bytes" -gt "$final_size_bytes" ]]; then
             echo -e "  ${CYAN}Space saved:${NC}        $(numfmt --to=iec-i --suffix=B $((source_size_bytes - final_size_bytes)) 2>/dev/null || echo 'N/A')"
+        fi
+        
+        # Verify the squashfs file
+        log_progress "Verifying squashfs integrity..."
+        if $SUDO unsquashfs -stat "$squashfs_file" >/dev/null 2>&1; then
+            log_progress_done "SquashFS integrity verified"
         else
-            echo -e "  ${CYAN}Space saved:${NC}        N/A"
+            log_warning "Could not verify squashfs integrity"
         fi
         
         return 0
     else
         log_error "SquashFS creation failed"
+        echo ""
+        echo "Diagnostic information saved to: $WORKDIR/.squashfs_diagnostic"
+        echo "Log file: $squashfs_log"
+        
+        # Show last few lines of log
+        if [[ -f "$squashfs_log" ]]; then
+            echo ""
+            echo "Last 10 lines of squashfs log:"
+            tail -10 "$squashfs_log"
+        fi
+        
+        # Suggest solutions
+        echo ""
+        echo -e "${YELLOW}Possible solutions:${NC}"
+        echo "1. Free up more memory and try again"
+        echo "2. Use a smaller block size: add '-b 256K' to squashfs options"
+        echo "3. Use gzip compression instead of XZ for large filesystems"
+        echo "4. Check disk space: df -h $WORKDIR"
+        echo "5. Check system resources: free -h"
+        
         return 1
     fi
 }
@@ -1787,7 +1963,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Fixed rsync performance issues and improved reliability${NC}"
+    echo -e "${GREEN}Fixed SquashFS crashes on large filesystems${NC}"
     echo ""
 }
 
@@ -1961,7 +2137,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Fixed rsync hanging and improved kernel detection!"
+            echo "Fixed SquashFS crashes and improved stability for large filesystems!"
             exit 0
             ;;
         -q|--quiet)
