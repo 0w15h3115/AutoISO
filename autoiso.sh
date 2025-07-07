@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.2.0 - Professional Live ISO Creator with Mount Point Protection
-# Fixed to prevent copying mounted drives during system replication
+# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Kali Linux Support
+# Fixed chroot configuration and network setup
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.1.3"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -157,147 +157,11 @@ load_state() {
 }
 
 # ========================================
-#    MOUNT POINT DETECTION AND PROTECTION
-# ========================================
-
-# Get all mount points except special filesystems
-get_all_mount_points() {
-    # Get mount points, excluding special filesystems
-    mount | grep -E '^/dev/' | awk '{print $3}' | sort -r
-}
-
-# Get mount points that are subdirectories of a given path
-get_submounts() {
-    local base_path="$1"
-    local mount_point
-    
-    while IFS= read -r mount_point; do
-        # Skip the base path itself
-        if [[ "$mount_point" == "$base_path" ]]; then
-            continue
-        fi
-        
-        # Check if this mount point is under our base path
-        if [[ "$mount_point" == "$base_path"/* ]]; then
-            echo "$mount_point"
-        fi
-    done < <(get_all_mount_points)
-}
-
-# Build comprehensive exclusion list including all mount points
-build_exclude_list() {
-    local exclude_patterns=(
-        # Standard system exclusions
-        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
-        "/lost+found" "/.cache" "/var/cache/apt" "/var/log"
-        "/var/lib/docker" "/snap" "/swapfile" "$WORKDIR"
-        
-        # Additional safety exclusions
-        "/var/tmp" "/var/crash" "/var/backups"
-    )
-    
-    # Add all mount points that aren't the root filesystem
-    local mount_point
-    while IFS= read -r mount_point; do
-        if [[ "$mount_point" != "/" ]]; then
-            exclude_patterns+=("$mount_point")
-            log_debug "Excluding mount point: $mount_point"
-        fi
-    done < <(get_all_mount_points)
-    
-    # Add Kali-specific exclusions if needed
-    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
-        exclude_patterns+=(
-            "/root/.cache"
-            "/root/.local/share/Trash"
-            "/opt/metasploit-framework/embedded/framework/.git"
-        )
-    fi
-    
-    # Remove duplicates and sort
-    local unique_excludes=($(printf '%s\n' "${exclude_patterns[@]}" | sort -u))
-    
-    echo "${unique_excludes[@]}"
-}
-
-# Check if extract directory has any mounted filesystems
-check_extract_dir_mounts() {
-    local extract_dir="$1"
-    local has_mounts=false
-    local mount_point
-    
-    # Check if extract_dir itself is a mount point
-    if mountpoint -q "$extract_dir" 2>/dev/null; then
-        log_warning "$extract_dir is a mount point itself"
-    fi
-    
-    # Check for any mounts under extract_dir
-    local submounts=$(get_submounts "$extract_dir")
-    if [[ -n "$submounts" ]]; then
-        log_error "Found mounted filesystems under $extract_dir:"
-        echo "$submounts" | while read -r mount_point; do
-            log_error "  - $mount_point"
-        done
-        has_mounts=true
-    fi
-    
-    if [[ "$has_mounts" == "true" ]]; then
-        log_error "Cannot proceed with mounted filesystems in extract directory"
-        log_info "Please unmount them first or they will be included in the ISO"
-        return 1
-    fi
-    
-    return 0
-}
-
-# Validate extracted size is reasonable
-validate_extracted_size() {
-    local extract_dir="$1"
-    local max_reasonable_size_gb=100  # Adjust based on your needs
-    
-    local size_gb=$(du -sx "$extract_dir" 2>/dev/null | awk '{print int($1/1024/1024)}')
-    
-    if [[ $size_gb -gt $max_reasonable_size_gb ]]; then
-        log_warning "Extracted filesystem is ${size_gb}GB - larger than expected"
-        log_warning "This might indicate mounted filesystems were copied"
-        
-        # Show largest directories
-        log_info "Largest directories in extract:"
-        du -sh "$extract_dir"/* 2>/dev/null | sort -rh | head -10
-        
-        read -p "Continue anyway? (y/N): " -r continue_anyway
-        if [[ ! "$continue_anyway" =~ ^[Yy]$ ]]; then
-            return 1
-        fi
-    fi
-    
-    return 0
-}
-
-# ========================================
 #    CLEANUP AND ERROR HANDLING
 # ========================================
 
 cleanup_all() {
     log_info "Starting cleanup process..."
-    
-    # Kill any background processes we might have started
-    local autoiso_pids=$(pgrep -f "autoiso.sh" | grep -v $$ || true)
-    if [[ -n "$autoiso_pids" ]]; then
-        log_debug "Cleaning up background processes: $autoiso_pids"
-        kill -TERM $autoiso_pids 2>/dev/null || true
-        sleep 2
-        kill -9 $autoiso_pids 2>/dev/null || true
-    fi
-    
-    # Kill any mksquashfs processes that might be hanging
-    local squashfs_pids=$(pgrep -f "mksquashfs" || true)
-    if [[ -n "$squashfs_pids" ]]; then
-        log_debug "Cleaning up squashfs processes: $squashfs_pids"
-        $SUDO kill -TERM $squashfs_pids 2>/dev/null || true
-        sleep 2
-        $SUDO kill -9 $squashfs_pids 2>/dev/null || true
-    fi
     
     # Show cleanup progress
     local cleanup_steps=("Unmounting filesystems" "Removing temporary files" "Closing logs")
@@ -328,6 +192,7 @@ cleanup_mounts_enhanced() {
         "$EXTRACT_DIR/dev"
         "$EXTRACT_DIR/proc"
         "$EXTRACT_DIR/sys"
+        "$EXTRACT_DIR/run"
     )
     
     for mount_point in "${mount_points[@]}"; do
@@ -413,7 +278,6 @@ validate_system() {
     local validation_steps=(
         "Distribution compatibility:validate_distribution"
         "Required tools:validate_required_tools"
-        "Mount points:validate_mount_points"
         "Disk space:validate_space_detailed"
         "System health:validate_system_health"
         "Kernel files:validate_kernel_files"
@@ -445,50 +309,6 @@ validate_system() {
     fi
     
     log_success "System validation completed successfully"
-    return 0
-}
-
-validate_mount_points() {
-    log_info "Detecting mounted filesystems..."
-    
-    # Show all mount points that will be excluded
-    local mount_points=($(get_all_mount_points))
-    local excluded_count=0
-    
-    echo ""
-    echo "Mounted filesystems detected:"
-    for mount_point in "${mount_points[@]}"; do
-        if [[ "$mount_point" == "/" ]]; then
-            echo "  $mount_point (root - will be copied)"
-        else
-            echo "  $mount_point (will be excluded)"
-            ((excluded_count++))
-        fi
-    done
-    
-    if [[ $excluded_count -gt 0 ]]; then
-        echo ""
-        log_info "Found $excluded_count mounted filesystem(s) that will be excluded from the ISO"
-        
-        # Check for large mounted drives
-        local large_mounts=()
-        for mount_point in "${mount_points[@]}"; do
-            if [[ "$mount_point" != "/" ]]; then
-                local size_gb=$(df "$mount_point" 2>/dev/null | awk 'NR==2 {print int($2/1024/1024)}' || echo "0")
-                if [[ $size_gb -gt 100 ]]; then
-                    large_mounts+=("$mount_point (${size_gb}GB)")
-                fi
-            fi
-        done
-        
-        if [[ ${#large_mounts[@]} -gt 0 ]]; then
-            log_warning "Large mounted drives detected that will be excluded:"
-            for mount in "${large_mounts[@]}"; do
-                echo "  - $mount"
-            done
-        fi
-    fi
-    
     return 0
 }
 
@@ -532,7 +352,6 @@ validate_required_tools() {
         "chroot:coreutils"
         "mount:mount"
         "umount:mount"
-        "mountpoint:util-linux"
     )
     
     local missing_packages=()
@@ -631,8 +450,8 @@ calculate_system_size_smart() {
     # Try multiple methods in order of accuracy
     local size_kb=0
     
-    # Method 1: Precise du calculation with mount exclusions
-    if size_kb=$(calculate_size_du_safe); then
+    # Method 1: Precise du calculation
+    if size_kb=$(calculate_size_du); then
         echo "$size_kb"
         return 0
     fi
@@ -651,30 +470,25 @@ calculate_system_size_smart() {
     fi
 }
 
-calculate_size_du_safe() {
-    # Build exclude arguments from our comprehensive exclude list
+calculate_size_du() {
     local exclude_args=()
-    local excludes=($(build_exclude_list))
+    local exclude_patterns=(
+        "/dev" "/proc" "/sys" "/tmp" "/run" "/mnt" "/media"
+        "/var/cache" "/var/log" "/var/tmp" "$WORKDIR"
+    )
     
-    for pattern in "${excludes[@]}"; do
+    for pattern in "${exclude_patterns[@]}"; do
         exclude_args+=(--exclude="$pattern")
     done
     
     local size_output
-    # Add timeout to prevent hanging
-    if command -v timeout >/dev/null 2>&1; then
-        size_output=$(timeout 60 du -sx "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
-    else
-        size_output=$(du -sx "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
-    fi
+    size_output=$(timeout 60 du -sk "${exclude_args[@]}" / 2>/dev/null | cut -f1 || echo "0")
     
     # Ensure we have a valid number
     if [[ ! "$size_output" =~ ^[0-9]+$ ]]; then
         echo "0"
-        return 1
     else
         echo "$size_output"
-        return 0
     fi
 }
 
@@ -879,171 +693,154 @@ validate_kernel_files() {
 }
 
 # ========================================
-#    CORE BUILD FUNCTIONS (MOUNT-SAFE)
+#    CORE BUILD FUNCTIONS
 # ========================================
 
-show_disk_activity() {
-    # Show disk I/O stats if available
-    if command -v iostat >/dev/null 2>&1; then
-        echo -n "  Disk activity: "
-        iostat -d 1 2 | tail -n 2 | head -n 1 | awk '{print "Read: " $3 " KB/s, Write: " $4 " KB/s"}' || echo "monitoring..."
-    fi
-}
-
 enhanced_rsync() {
-    show_header "System Copy (Mount-Safe)"
+    show_header "System Copy"
     
     local rsync_log="$WORKDIR/logs/rsync.log"
-    
-    # Build comprehensive exclusion list
-    log_info "Building exclusion list for mounted filesystems..."
-    local exclude_list=($(build_exclude_list))
-    
-    echo ""
-    log_info "Excluding ${#exclude_list[@]} paths from copy (including all mounted filesystems)"
+    local rsync_partial_dir="$WORKDIR/.rsync-partial"
+    mkdir -p "$rsync_partial_dir"
     
     # First, estimate the total size to copy
     log_info "Calculating system size for accurate progress..."
     local total_size_bytes
     local total_size_human
     
-    # Get estimated size using our safe calculation
-    local system_size_kb=$(calculate_size_du_safe)
+    # Get estimated size (this is fast) - ensure we get a valid number
+    local df_output
+    df_output=$(df / | awk 'NR==2 {print $3}' || echo "0")
     
     # Validate it's a number
-    if [[ "$system_size_kb" =~ ^[0-9]+$ ]] && [[ $system_size_kb -gt 0 ]]; then
-        total_size_bytes=$((system_size_kb * 1024))
+    if [[ "$df_output" =~ ^[0-9]+$ ]]; then
+        total_size_bytes=$((df_output * 1024))
     else
         # Fallback to a reasonable estimate
         total_size_bytes=$((10 * 1024 * 1024 * 1024))  # 10GB in bytes
     fi
     
-    total_size_human=$(numfmt --to=si --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
+    total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
     
     log_info "Estimated data to copy: $total_size_human"
-    
-    # Check if this seems reasonable
-    local size_gb=$((total_size_bytes / 1024 / 1024 / 1024))
-    if [[ $size_gb -gt 50 ]]; then
-        log_warning "System size appears large (${size_gb}GB)"
-        log_warning "This might indicate mounted filesystems are being included"
-        read -p "Continue with copy? (y/N): " -r continue_copy
-        if [[ ! "$continue_copy" =~ ^[Yy]$ ]]; then
-            return 1
-        fi
-    fi
-    
     echo ""
     
-    # Build rsync options with all exclusions
+    # Optimized exclusion list with Kali-specific additions
+    local exclude_patterns=(
+        "/dev/*" "/proc/*" "/sys/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
+        "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
+        "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
+    )
+    
+    # Add Kali-specific exclusions if needed
+    if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
+        exclude_patterns+=(
+            "/root/.cache"
+            "/root/.local/share/Trash"
+            "/opt/metasploit-framework/embedded/framework/.git"
+        )
+    fi
+    
     local rsync_opts=(
-        -aHx
+        -aAXHx
+        --partial
+        --partial-dir="$rsync_partial_dir"
         --numeric-ids
         --one-file-system
         --log-file="$rsync_log"
         --stats
         --human-readable
-        --info=progress2
     )
     
-    # Add all exclusions
-    for pattern in "${exclude_list[@]}"; do
+    for pattern in "${exclude_patterns[@]}"; do
         rsync_opts+=(--exclude="$pattern")
     done
     
-    log_info "Starting system copy... This may take 10-30 minutes depending on system size and disk speed."
-    log_info "Only copying the root filesystem - all other mounts are excluded"
+    log_info "Starting system copy... This may take 10-30 minutes depending on system size."
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
-    # Create exclude list file for debugging
-    printf '%s\n' "${exclude_list[@]}" > "$WORKDIR/exclude-list.txt"
-    log_debug "Exclude list saved to: $WORKDIR/exclude-list.txt"
-    
-    # MOUNT-SAFE: Use simpler progress monitoring
+    # Create a background process to monitor progress
     local stats_file="$WORKDIR/.rsync_stats"
     local start_time=$(date +%s)
-    
-    # Start rsync with performance optimizations
-    log_info "Running rsync (mount-safe mode)..."
-    echo ""
-    
-    # Create a more robust rsync execution
     local rsync_pid
-    local monitor_pid
     
     # Start rsync in background
-    $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" > "$stats_file" 2>&1 &
-    rsync_pid=$!
-    
-    # Start a separate progress monitor
-    (
-        while kill -0 $rsync_pid 2>/dev/null; do
-            local current_time=$(date +%s)
-            local elapsed=$((current_time - start_time))
-            local minutes=$((elapsed / 60))
-            local seconds=$((elapsed % 60))
-            
-            # Check current size of extract dir
-            local current_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "calculating...")
-            
-            printf "\r${CYAN}Copying system files...${NC} Time: %02d:%02d Size: %s     " \
-                "$minutes" "$seconds" "$current_size"
-            
-            sleep 5
-        done
-    ) &
-    monitor_pid=$!
+    $SUDO rsync "${rsync_opts[@]}" / "$EXTRACT_DIR/" 2>&1 | \
+        tee "$stats_file" | \
+        grep -E "to-check=|xfr#" | \
+        while IFS= read -r line; do
+            # Parse rsync output for better progress display
+            if [[ "$line" =~ to-check=([0-9]+)/([0-9]+) ]]; then
+                local remaining="${BASH_REMATCH[1]}"
+                local total="${BASH_REMATCH[2]}"
+                local completed=$((total - remaining))
+                local percent=$((completed * 100 / total))
+                
+                # Calculate speed and ETA
+                local current_time=$(date +%s)
+                local elapsed=$((current_time - start_time))
+                
+                if [[ $elapsed -gt 0 && $completed -gt 0 ]]; then
+                    local rate=$((completed / elapsed))
+                    local eta=$((remaining / rate))
+                    local eta_min=$((eta / 60))
+                    local eta_sec=$((eta % 60))
+                    
+                    # Format the progress line
+                    printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% " \
+                        "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
+                        "$percent"
+                    
+                    printf "${CYAN}Files:${NC} %d/%d " "$completed" "$total"
+                    
+                    if [[ $eta_min -gt 0 ]]; then
+                        printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
+                    else
+                        printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
+                    fi
+                fi
+            elif [[ "$line" =~ xfr#([0-9]+),.*to-chk=([0-9]+)/([0-9]+) ]]; then
+                # Alternative parsing for different rsync versions
+                local transferred="${BASH_REMATCH[1]}"
+                local remaining="${BASH_REMATCH[2]}"
+                local total="${BASH_REMATCH[3]}"
+                local completed=$((total - remaining))
+                local percent=$((completed * 100 / total))
+                
+                printf "\r${CYAN}Progress:${NC} [%-50s] %3d%% ${CYAN}Files:${NC} %d/%d     " \
+                    "$(printf '█%.0s' $(seq 1 $((percent / 2))))" \
+                    "$percent" "$completed" "$total"
+            fi
+        done &
     
     # Wait for rsync to complete
-    wait $rsync_pid
+    wait
     local rsync_status=$?
-    
-    # Clean up monitor process
-    kill $monitor_pid 2>/dev/null || true
-    wait $monitor_pid 2>/dev/null || true
     
     echo "" # New line after progress
     
     if [[ $rsync_status -eq 0 ]]; then
-        local elapsed=$(($(date +%s) - start_time))
-        local minutes=$((elapsed / 60))
-        local seconds=$((elapsed % 60))
-        
-        # Validate the extracted size
-        log_info "Validating extracted filesystem size..."
-        if ! validate_extracted_size "$EXTRACT_DIR"; then
-            log_error "Extracted size validation failed"
-            return 1
-        fi
-        
-        # Check for any mounted filesystems in extract
-        log_info "Checking for mounted filesystems in extract directory..."
-        if ! check_extract_dir_mounts "$EXTRACT_DIR"; then
-            log_error "Found mounted filesystems in extract directory"
-            return 1
-        fi
-        
         # Parse final statistics
         if [[ -f "$stats_file" ]]; then
             local files_transferred=$(grep -E "Number of.*files transferred:" "$stats_file" | awk '{print $NF}' || echo "N/A")
             local total_size=$(grep -E "Total file size:" "$stats_file" | awk '{print $4,$5}' || echo "N/A")
             local transferred_size=$(grep -E "Total transferred file size:" "$stats_file" | awk '{print $5,$6}' || echo "N/A")
+            local speedup=$(grep -E "Speedup is" "$stats_file" | awk '{print $3}' || echo "N/A")
             
             echo ""
             log_success "System copy completed successfully!"
             echo ""
             echo -e "${BOLD}Copy Statistics:${NC}"
-            echo -e "  ${CYAN}Time taken:${NC}        ${minutes}m ${seconds}s"
             echo -e "  ${CYAN}Files copied:${NC}      $files_transferred"
             echo -e "  ${CYAN}Total size:${NC}        $total_size"
             echo -e "  ${CYAN}Transferred:${NC}       $transferred_size"
+            echo -e "  ${CYAN}Compression ratio:${NC} $speedup"
             
-            # Show final copied size
+            # Show actual copied size
             local copied_size
             copied_size=$(du -sh "$EXTRACT_DIR" 2>/dev/null | cut -f1 || echo "N/A")
-            echo -e "  ${CYAN}Final size on disk:${NC} $copied_size"
-            echo -e "  ${CYAN}Excluded mounts:${NC}    ${#exclude_list[@]} paths"
+            echo -e "  ${CYAN}Size on disk:${NC}      $copied_size"
         fi
         
         save_state "rsync_complete"
@@ -1052,8 +849,6 @@ enhanced_rsync() {
         log_error "System copy failed (exit code: $rsync_status)"
         echo ""
         echo "Check the log file for details: $rsync_log"
-        echo "Check the stats file for details: $stats_file"
-        echo "Check excluded paths: $WORKDIR/exclude-list.txt"
         return 1
     fi
 }
@@ -1076,13 +871,6 @@ format_bytes() {
 post_copy_cleanup() {
     show_header "Post-Copy Optimization"
     
-    # Extra safety check - ensure no mounts in extract
-    log_info "Final mount point check before cleanup..."
-    if ! check_extract_dir_mounts "$EXTRACT_DIR"; then
-        log_error "Cannot proceed - mounted filesystems detected"
-        return 1
-    fi
-    
     local cleanup_tasks=(
         "Package caches:clean_package_caches"
         "Log files:clean_logs"
@@ -1096,26 +884,12 @@ post_copy_cleanup() {
         cleanup_tasks+=("Kali histories:clean_kali_specific")
     fi
     
-    local task_count=0
-    local total_tasks=${#cleanup_tasks[@]}
-    
     for task in "${cleanup_tasks[@]}"; do
         local desc="${task%:*}"
         local func="${task#*:}"
-        ((task_count++))
-        
-        log_progress "Cleaning $desc... ($task_count/$total_tasks)"
-        
-        # Run cleanup with progress monitoring
-        local cleanup_start=$(date +%s)
-        
-        # Call the function directly with monitoring
-        if $func; then
-            local cleanup_duration=$(($(date +%s) - cleanup_start))
-            log_progress_done "Cleaned $desc (${cleanup_duration}s)"
-        else
-            log_warning "Error cleaning $desc"
-        fi
+        log_progress "Cleaning $desc..."
+        $func
+        log_progress_done "Cleaned $desc"
     done
     
     log_success "Post-copy cleanup completed"
@@ -1123,23 +897,16 @@ post_copy_cleanup() {
 }
 
 clean_package_caches() {
-    # Use faster, safer cleanup methods
-    $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb 2>/dev/null || true
-    $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"* 2>/dev/null || true
-    return 0
+    $SUDO rm -rf "$EXTRACT_DIR/var/cache/apt/archives/"*.deb
+    $SUDO rm -rf "$EXTRACT_DIR/var/lib/apt/lists/"*
 }
 
 clean_logs() {
-    # Simple, fast log cleanup
     $SUDO find "$EXTRACT_DIR/var/log" -type f \( -name "*.log" -o -name "*.gz" \) -delete 2>/dev/null || true
-    return 0
 }
 
 clean_temp() {
-    # Fast temp cleanup
-    $SUDO rm -rf "$EXTRACT_DIR/tmp/"* 2>/dev/null || true
-    $SUDO rm -rf "$EXTRACT_DIR/var/tmp/"* 2>/dev/null || true
-    return 0
+    $SUDO rm -rf "$EXTRACT_DIR/tmp/"* "$EXTRACT_DIR/var/tmp/"*
 }
 
 clean_ssh_keys() {
@@ -1165,6 +932,14 @@ clean_kali_specific() {
 configure_chroot_enhanced() {
     show_header "Chroot Configuration"
     
+    # Setup network configuration BEFORE mounting
+    log_progress "Setting up network configuration..."
+    if ! setup_chroot_network; then
+        log_error "Failed to setup network configuration"
+        return 1
+    fi
+    log_progress_done "Network configured"
+    
     log_progress "Setting up chroot mounts..."
     if ! setup_chroot_mounts; then
         log_error "Failed to setup chroot mounts"
@@ -1188,6 +963,11 @@ configure_chroot_enhanced() {
     log_progress "Installing live system packages..."
     if ! $SUDO chroot "$EXTRACT_DIR" /bin/bash /tmp/configure_system.sh; then
         log_error "Chroot configuration failed"
+        # Show chroot log for debugging
+        if [[ -f "$EXTRACT_DIR/tmp/chroot.log" ]]; then
+            log_error "Chroot log contents:"
+            cat "$EXTRACT_DIR/tmp/chroot.log" >&2
+        fi
         return 1
     fi
     log_progress_done "Live system configured"
@@ -1198,12 +978,35 @@ configure_chroot_enhanced() {
     return 0
 }
 
+setup_chroot_network() {
+    # Copy DNS configuration
+    if [[ -f /etc/resolv.conf ]]; then
+        log_debug "Copying DNS configuration"
+        $SUDO cp -L /etc/resolv.conf "$EXTRACT_DIR/etc/resolv.conf.tmp"
+        $SUDO mv "$EXTRACT_DIR/etc/resolv.conf.tmp" "$EXTRACT_DIR/etc/resolv.conf"
+    fi
+    
+    # Copy hosts file if missing
+    if [[ ! -f "$EXTRACT_DIR/etc/hosts" ]]; then
+        log_debug "Copying hosts file"
+        $SUDO cp /etc/hosts "$EXTRACT_DIR/etc/hosts"
+    fi
+    
+    # Ensure hostname is set
+    if [[ ! -f "$EXTRACT_DIR/etc/hostname" ]]; then
+        echo "localhost" | $SUDO tee "$EXTRACT_DIR/etc/hostname" >/dev/null
+    fi
+    
+    return 0
+}
+
 setup_chroot_mounts() {
     local mounts=(
         "proc:proc:/proc"
         "sysfs:sysfs:/sys"
         "devtmpfs:udev:/dev"
         "devpts:devpts:/dev/pts"
+        "tmpfs:tmpfs:/run"
     )
     
     for mount_spec in "${mounts[@]}"; do
@@ -1211,9 +1014,11 @@ setup_chroot_mounts() {
         local mount_path="$EXTRACT_DIR$target"
         
         $SUDO mkdir -p "$mount_path"
-        if ! $SUDO mount -t "$fstype" "$source" "$mount_path"; then
-            log_error "Failed to mount $fstype at $mount_path"
-            return 1
+        if ! mountpoint -q "$mount_path" 2>/dev/null; then
+            if ! $SUDO mount -t "$fstype" "$source" "$mount_path"; then
+                log_error "Failed to mount $fstype at $mount_path"
+                return 1
+            fi
         fi
     done
     
@@ -1229,42 +1034,86 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 export LANG=C.UTF-8
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# Logging
+exec > >(tee -a /tmp/chroot.log)
+exec 2>&1
+
+echo "[CHROOT] Starting configuration at $(date)"
+
+# Test network connectivity
+echo "[CHROOT] Testing network connectivity..."
+if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    echo "[CHROOT] Warning: No internet connectivity detected"
+fi
+
+# Update package database with retries
 echo "[CHROOT] Updating package database..."
-apt-get update || true
+for i in {1..3}; do
+    if apt-get update; then
+        echo "[CHROOT] Package database updated successfully"
+        break
+    else
+        echo "[CHROOT] Update attempt $i failed, retrying..."
+        sleep 2
+    fi
+done
 
-# Essential packages
+# Essential packages for live system
 PACKAGES=(
     casper
     lupin-casper
     discover
     laptop-detect
     os-prober
-    linux-generic
     net-tools
     network-manager
+    network-manager-gnome
 )
+
+# Add kernel package if not already installed
+if ! dpkg -l | grep -q "^ii.*linux-image"; then
+    echo "[CHROOT] No kernel found, adding linux-generic to package list"
+    PACKAGES+=(linux-generic)
+fi
 
 echo "[CHROOT] Installing packages..."
 for pkg in "${PACKAGES[@]}"; do
     echo "[CHROOT] Installing: $pkg"
-    apt-get install -y "$pkg" || echo "[CHROOT] Warning: Failed to install $pkg"
+    if apt-get install -y --no-install-recommends "$pkg"; then
+        echo "[CHROOT] Successfully installed: $pkg"
+    else
+        echo "[CHROOT] Warning: Failed to install $pkg (may not be critical)"
+    fi
 done
+
+# Configure live user
+echo "[CHROOT] Configuring live user..."
+if ! id -u user >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -G sudo,audio,video,plugdev,netdev,cdrom user || true
+    echo "user:live" | chpasswd || true
+fi
 
 # Configure locales
 echo "[CHROOT] Configuring locales..."
-locale-gen en_US.UTF-8 || true
-update-locale LANG=en_US.UTF-8 || true
+if command -v locale-gen >/dev/null 2>&1; then
+    locale-gen en_US.UTF-8 || true
+    update-locale LANG=en_US.UTF-8 || true
+fi
 
 # Update initramfs
 echo "[CHROOT] Updating initramfs..."
-update-initramfs -u || update-initramfs -c -k all || true
+if command -v update-initramfs >/dev/null 2>&1; then
+    update-initramfs -u -k all || update-initramfs -c -k all || true
+fi
 
 # Clean up
+echo "[CHROOT] Cleaning up..."
 apt-get autoremove -y || true
 apt-get autoclean || true
 
-echo "[CHROOT] Configuration complete"
+echo "[CHROOT] Configuration complete at $(date)"
 CHROOT_SCRIPT
 
     $SUDO chmod +x "$script_path"
@@ -1279,12 +1128,31 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 export LANG=C.UTF-8
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-echo "[CHROOT] Kali Linux specific configuration..."
+# Logging
+exec > >(tee -a /tmp/chroot.log)
+exec 2>&1
 
-# Update package database
+echo "[CHROOT] Starting Kali Linux configuration at $(date)"
+
+# Test network connectivity
+echo "[CHROOT] Testing network connectivity..."
+if ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    echo "[CHROOT] Warning: No internet connectivity detected"
+fi
+
+# Update package database with retries
 echo "[CHROOT] Updating package database..."
-apt-get update || true
+for i in {1..3}; do
+    if apt-get update; then
+        echo "[CHROOT] Package database updated successfully"
+        break
+    else
+        echo "[CHROOT] Update attempt $i failed, retrying..."
+        sleep 2
+    fi
+done
 
 # Kali-specific packages for live system
 PACKAGES=(
@@ -1292,76 +1160,80 @@ PACKAGES=(
     live-boot-initramfs-tools
     live-config
     live-config-systemd
-    linux-image-amd64
     systemd-sysv
     network-manager
     wpasupplicant
     firmware-linux
-    firmware-linux-nonfree
-    firmware-misc-nonfree
 )
 
+# Add kernel if not present
+if ! dpkg -l | grep -q "^ii.*linux-image"; then
+    echo "[CHROOT] No kernel found, adding linux-image-amd64"
+    PACKAGES+=(linux-image-amd64)
+fi
+
+# Try to install packages, but don't fail if some are missing
 echo "[CHROOT] Installing Kali live system packages..."
 for pkg in "${PACKAGES[@]}"; do
     echo "[CHROOT] Installing: $pkg"
-    apt-get install -y "$pkg" || echo "[CHROOT] Warning: Failed to install $pkg"
+    if apt-get install -y --no-install-recommends "$pkg" 2>/dev/null; then
+        echo "[CHROOT] Successfully installed: $pkg"
+    else
+        echo "[CHROOT] Warning: Could not install $pkg (trying without recommends)"
+        apt-get install -y --no-install-recommends --ignore-missing "$pkg" 2>/dev/null || \
+        echo "[CHROOT] Warning: Package $pkg not available"
+    fi
 done
+
+# Configure live user for Kali
+echo "[CHROOT] Configuring Kali live user..."
+if ! id -u kali >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -G sudo,audio,video,plugdev,netdev,bluetooth,cdrom kali || true
+    echo "kali:kali" | chpasswd || true
+fi
 
 # Configure locales
 echo "[CHROOT] Configuring locales..."
-locale-gen en_US.UTF-8 || true
-update-locale LANG=en_US.UTF-8 || true
+if command -v locale-gen >/dev/null 2>&1; then
+    locale-gen en_US.UTF-8 || true
+    update-locale LANG=en_US.UTF-8 || true
+fi
 
 # Update initramfs for live boot
 echo "[CHROOT] Updating initramfs for live boot..."
-update-initramfs -u || update-initramfs -c -k all || true
+if command -v update-initramfs >/dev/null 2>&1; then
+    update-initramfs -u -k all || update-initramfs -c -k all || true
+fi
 
-# Configure live-boot
+# Configure live-boot for Kali
 echo "[CHROOT] Configuring live-boot..."
+mkdir -p /etc/live
 cat > /etc/live/config.conf << EOF
 LIVE_HOSTNAME="kali"
 LIVE_USERNAME="kali"
 LIVE_USER_FULLNAME="Kali Live User"
-LIVE_USER_DEFAULT_GROUPS="audio cdrom dialout floppy video plugdev netdev sudo"
+LIVE_USER_DEFAULT_GROUPS="audio cdrom dialout floppy video plugdev netdev bluetooth sudo"
 EOF
 
 # Clean up
+echo "[CHROOT] Cleaning up..."
 apt-get autoremove -y || true
 apt-get autoclean || true
 
-echo "[CHROOT] Kali configuration complete"
+echo "[CHROOT] Kali configuration complete at $(date)"
 CHROOT_SCRIPT
 
     $SUDO chmod +x "$script_path"
 }
 
-# ========================================
-#    MOUNT-SAFE SQUASHFS FUNCTION
-# ========================================
-
 create_squashfs_enhanced() {
-    show_header "Creating SquashFS (Mount-Safe)"
-    
-    # Final safety check before squashfs
-    log_info "Final safety check for mounted filesystems..."
-    if ! check_extract_dir_mounts "$EXTRACT_DIR"; then
-        log_error "Cannot create squashfs - mounted filesystems detected in extract"
-        return 1
-    fi
+    show_header "Creating SquashFS"
     
     local squashfs_file="$CDROOT_DIR/live/filesystem.squashfs"
     
-    # Calculate optimal parameters with memory safety
+    # Calculate optimal parameters
     local processors=$(nproc)
-    local available_mem_mb=$(free -m | awk '/^Mem:/ {print $2}')
-    local mem_limit=$((available_mem_mb / 4))  # Use only 25% of RAM for safety
-    
-    # Minimum 512MB, maximum 4GB for mksquashfs
-    if [[ $mem_limit -lt 512 ]]; then
-        mem_limit=512
-    elif [[ $mem_limit -gt 4096 ]]; then
-        mem_limit=4096
-    fi
+    local mem_limit=$(($(free -m | awk '/^Mem:/ {print $2}') / 2))
     
     # Get source size for estimation
     log_info "Analyzing source data..."
@@ -1383,26 +1255,6 @@ create_squashfs_enhanced() {
         source_size_human="N/A"
     fi
     
-    # Final size check - if it's huge, something went wrong
-    local size_gb=$((source_size_bytes / 1024 / 1024 / 1024))
-    if [[ $size_gb -gt 50 ]]; then
-        log_error "Extract directory is ${size_gb}GB - this is unexpectedly large!"
-        log_error "This usually means mounted filesystems were included in the copy"
-        
-        # Show what's taking up space
-        log_info "Largest directories in extract:"
-        du -sh "$EXTRACT_DIR"/* 2>/dev/null | sort -rh | head -10
-        
-        return 1
-    fi
-    
-    # Check if this is a large filesystem (>10GB)
-    local is_large_fs=false
-    if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$source_size_bytes" -gt $((10 * 1024 * 1024 * 1024)) ]]; then
-        is_large_fs=true
-        log_warning "Large filesystem detected (>10GB). Using optimized settings."
-    fi
-    
     # Estimate compressed size (typically 40-50% of original)
     local estimated_compressed=0
     if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$source_size_bytes" -gt 0 ]]; then
@@ -1411,181 +1263,65 @@ create_squashfs_enhanced() {
     
     log_info "Source size: $source_size_human"
     log_info "Estimated compressed size: ~${estimated_compressed}MB"
-    log_info "Using $processors CPU cores and ${mem_limit}MB memory limit"
-    
-    # Check available memory before starting
-    local free_mem_mb=$(free -m | awk '/^Mem:/ {print $4}')
-    if [[ $free_mem_mb -lt 1024 ]]; then
-        log_warning "Low memory available: ${free_mem_mb}MB free"
-        log_info "Consider closing other applications or using a system with more RAM"
-    fi
-    
+    log_info "Using $processors CPU cores and ${mem_limit}MB memory"
     echo ""
-    
-    # Choose compression based on filesystem size
-    local compression_method="xz"
-    local compression_opts=()
-    
-    if [[ "$is_large_fs" == "true" ]]; then
-        # For large filesystems, use gzip for better stability
-        compression_method="gzip"
-        compression_opts=(-comp gzip -Xcompression-level 6)
-        log_info "Using gzip compression for stability on large filesystem"
-    else
-        # For smaller filesystems, use XZ with careful settings
-        compression_opts=(-comp xz -Xbcj x86 -Xdict-size 100%)
-        log_info "Using XZ compression for better ratio on smaller filesystem"
-    fi
     
     local squashfs_opts=(
         -no-exports
         -noappend
-        "${compression_opts[@]}"
+        -comp xz
+        -Xbcj x86
         -b 1M
         -processors "$processors"
         -mem "${mem_limit}M"
     )
     
-    log_info "Creating compressed filesystem... This may take 5-30 minutes depending on size."
+    log_info "Creating compressed filesystem... This typically takes 5-15 minutes."
     echo ""
     
-    # Create a status file for monitoring
-    local status_file="$WORKDIR/.squashfs_status"
-    local progress_file="$WORKDIR/.squashfs_progress"
-    echo "0" > "$progress_file"
-    
-    # Save diagnostic info
-    cat > "$WORKDIR/.squashfs_diagnostic" << EOF
-SOURCE_SIZE: $source_size_human
-SOURCE_PATH: $EXTRACT_DIR
-DESTINATION: $squashfs_file
-COMPRESSION: $compression_method
-PROCESSORS: $processors
-MEMORY_LIMIT: ${mem_limit}MB
-AVAILABLE_MEM: ${free_mem_mb}MB
-STARTED: $(date)
-OPTIONS: ${squashfs_opts[@]}
-EOF
-    
-    # Start mksquashfs with better error handling
+    # Run mksquashfs with progress parsing
     local start_time=$(date +%s)
-    local squashfs_log="$WORKDIR/logs/squashfs.log"
-    local squashfs_pid
-    local monitor_pid
+    local last_percent=0
     
-    # Run mksquashfs in background with full logging
-    (
-        $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 | \
-        tee "$squashfs_log" | \
+    $SUDO mksquashfs "$EXTRACT_DIR" "$squashfs_file" "${squashfs_opts[@]}" 2>&1 | \
         grep -E "[0-9]+%" | \
         while IFS= read -r line; do
             if [[ "$line" =~ ([0-9]+)% ]]; then
-                echo "${BASH_REMATCH[1]}" > "$progress_file"
-            fi
-        done
-        echo $? > "$status_file"
-    ) &
-    squashfs_pid=$!
-    
-    # Monitor progress with timeout protection
-    local timeout_minutes=120  # 2 hour timeout for very large filesystems
-    local timeout_seconds=$((timeout_minutes * 60))
-    local last_progress=0
-    local stall_count=0
-    local max_stalls=20  # Allow up to 20 checks without progress (5 minutes)
-    
-    (
-        while kill -0 $squashfs_pid 2>/dev/null; do
-            local current_time=$(date +%s)
-            local elapsed=$((current_time - start_time))
-            
-            # Check for timeout
-            if [[ $elapsed -gt $timeout_seconds ]]; then
-                log_error "SquashFS creation timed out after ${timeout_minutes} minutes"
-                $SUDO kill -TERM $squashfs_pid 2>/dev/null || true
-                sleep 5
-                $SUDO kill -9 $squashfs_pid 2>/dev/null || true
-                break
-            fi
-            
-            # Read current progress
-            local current_progress=$(cat "$progress_file" 2>/dev/null || echo "0")
-            
-            # Check for stalls
-            if [[ "$current_progress" == "$last_progress" ]]; then
-                ((stall_count++))
-                if [[ $stall_count -gt $max_stalls ]]; then
-                    log_error "SquashFS appears to be stalled (no progress for 5 minutes)"
-                    # Save diagnostic info
-                    echo "STALLED at ${current_progress}% after ${elapsed}s" >> "$WORKDIR/.squashfs_diagnostic"
-                    ps aux | grep -E "(mksquashfs|xz)" >> "$WORKDIR/.squashfs_diagnostic"
-                    free -m >> "$WORKDIR/.squashfs_diagnostic"
+                local percent="${BASH_REMATCH[1]}"
+                
+                # Only update if percentage changed
+                if [[ $percent -ne $last_percent ]]; then
+                    last_percent=$percent
                     
-                    $SUDO kill -TERM $squashfs_pid 2>/dev/null || true
-                    sleep 5
-                    $SUDO kill -9 $squashfs_pid 2>/dev/null || true
-                    break
+                    # Calculate ETA
+                    local current_time=$(date +%s)
+                    local elapsed=$((current_time - start_time))
+                    
+                    if [[ $percent -gt 0 && $elapsed -gt 0 ]]; then
+                        local total_time=$((elapsed * 100 / percent))
+                        local remaining=$((total_time - elapsed))
+                        local eta_min=$((remaining / 60))
+                        local eta_sec=$((remaining % 60))
+                        
+                        # Show progress bar
+                        printf "\r${CYAN}Compression:${NC} ["
+                        printf "%-50s" "$(printf '█%.0s' $(seq 1 $((percent / 2))))"
+                        printf "] %3d%% " "$percent"
+                        
+                        if [[ $eta_min -gt 0 ]]; then
+                            printf "${CYAN}ETA:${NC} %dm %ds     " "$eta_min" "$eta_sec"
+                        else
+                            printf "${CYAN}ETA:${NC} %ds     " "$eta_sec"
+                        fi
+                    fi
                 fi
-            else
-                stall_count=0
-                last_progress=$current_progress
             fi
-            
-            # Calculate ETA
-            if [[ $current_progress -gt 0 ]]; then
-                local total_time=$((elapsed * 100 / current_progress))
-                local remaining=$((total_time - elapsed))
-                local eta_min=$((remaining / 60))
-                local eta_sec=$((remaining % 60))
-                
-                # Show progress
-                printf "\r${CYAN}Compression:${NC} ["
-                printf "%-50s" "$(printf '█%.0s' $(seq 1 $((current_progress / 2))))"
-                printf "] %3d%% " "$current_progress"
-                
-                if [[ $eta_min -gt 0 ]]; then
-                    printf "${CYAN}ETA:${NC} %dm %ds " "$eta_min" "$eta_sec"
-                else
-                    printf "${CYAN}ETA:${NC} %ds " "$eta_sec"
-                fi
-                
-                # Show memory usage
-                local mem_used=$(ps aux | grep -E "mksquashfs.*$squashfs_file" | awk '{sum+=$6} END {print int(sum/1024)}' || echo "0")
-                if [[ $mem_used -gt 0 ]]; then
-                    printf "${CYAN}Mem:${NC} %dMB     " "$mem_used"
-                fi
-            else
-                local minutes=$((elapsed / 60))
-                local seconds=$((elapsed % 60))
-                printf "\r${CYAN}Initializing compression...${NC} Time: %02d:%02d     " "$minutes" "$seconds"
-            fi
-            
-            sleep 15
         done
-    ) &
-    monitor_pid=$!
     
-    # Wait for squashfs to complete
-    wait $squashfs_pid
-    local wait_status=$?
-    
-    # Kill monitor
-    kill $monitor_pid 2>/dev/null || true
-    wait $monitor_pid 2>/dev/null || true
-    
+    local squashfs_status=$?
     echo "" # New line after progress
     
-    # Get actual exit status
-    local squashfs_status=$wait_status
-    if [[ -f "$status_file" ]]; then
-        squashfs_status=$(cat "$status_file")
-    fi
-    
-    # Update diagnostic file
-    echo "ENDED: $(date)" >> "$WORKDIR/.squashfs_diagnostic"
-    echo "EXIT_CODE: $squashfs_status" >> "$WORKDIR/.squashfs_diagnostic"
-    
-    if [[ $squashfs_status -eq 0 ]] && [[ -f "$squashfs_file" ]]; then
+    if [[ $squashfs_status -eq 0 ]]; then
         # Get final size and compression ratio
         local final_size_bytes
         local stat_output
@@ -1611,56 +1347,24 @@ EOF
             compression_ratio=$(awk "BEGIN {printf \"%.1f:1\", $source_size_bytes / $final_size_bytes}")
         fi
         
-        local elapsed=$(($(date +%s) - start_time))
-        local minutes=$((elapsed / 60))
-        local seconds=$((elapsed % 60))
-        
         echo ""
         log_success "SquashFS created successfully!"
         echo ""
         echo -e "${BOLD}Compression Statistics:${NC}"
-        echo -e "  ${CYAN}Time taken:${NC}         ${minutes}m ${seconds}s"
         echo -e "  ${CYAN}Original size:${NC}      $source_size_human"
         echo -e "  ${CYAN}Compressed size:${NC}    $final_size_human"
         echo -e "  ${CYAN}Compression ratio:${NC}  $compression_ratio"
-        echo -e "  ${CYAN}Compression type:${NC}   $compression_method"
         
         if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$final_size_bytes" =~ ^[0-9]+$ ]] && 
            [[ "$source_size_bytes" -gt "$final_size_bytes" ]]; then
             echo -e "  ${CYAN}Space saved:${NC}        $(numfmt --to=iec-i --suffix=B $((source_size_bytes - final_size_bytes)) 2>/dev/null || echo 'N/A')"
-        fi
-        
-        # Verify the squashfs file
-        log_progress "Verifying squashfs integrity..."
-        if $SUDO unsquashfs -stat "$squashfs_file" >/dev/null 2>&1; then
-            log_progress_done "SquashFS integrity verified"
         else
-            log_warning "Could not verify squashfs integrity"
+            echo -e "  ${CYAN}Space saved:${NC}        N/A"
         fi
         
         return 0
     else
         log_error "SquashFS creation failed"
-        echo ""
-        echo "Diagnostic information saved to: $WORKDIR/.squashfs_diagnostic"
-        echo "Log file: $squashfs_log"
-        
-        # Show last few lines of log
-        if [[ -f "$squashfs_log" ]]; then
-            echo ""
-            echo "Last 10 lines of squashfs log:"
-            tail -10 "$squashfs_log"
-        fi
-        
-        # Suggest solutions
-        echo ""
-        echo -e "${YELLOW}Possible solutions:${NC}"
-        echo "1. Free up more memory and try again"
-        echo "2. Use a smaller block size: add '-b 256K' to squashfs options"
-        echo "3. Use gzip compression instead of XZ for large filesystems"
-        echo "4. Check disk space: df -h $WORKDIR"
-        echo "5. Check system resources: free -h"
-        
         return 1
     fi
 }
@@ -1779,6 +1483,8 @@ setup_isolinux() {
         "/usr/lib/syslinux/modules/bios/ldlinux.c32"
         "/usr/lib/syslinux/modules/bios/libcom32.c32"
         "/usr/lib/syslinux/modules/bios/libutil.c32"
+        "/usr/lib/syslinux/modules/bios/menu.c32"
+        "/usr/lib/syslinux/modules/bios/vesamenu.c32"
     )
     
     for file in "${isolinux_files[@]}"; do
@@ -1799,16 +1505,34 @@ setup_isolinux() {
 
 setup_isolinux_default() {
     $SUDO tee "$CDROOT_DIR/boot/isolinux/isolinux.cfg" > /dev/null << 'EOF'
-DEFAULT live
+UI menu.c32
+PROMPT 0
+MENU TITLE Boot Menu
 TIMEOUT 300
 
 LABEL live
+  MENU LABEL ^Live System
+  MENU DEFAULT
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=casper quiet splash ---
+  APPEND initrd=/live/initrd.img boot=casper quiet splash ---
+
+LABEL live-nomodeset
+  MENU LABEL Live System (^nomodeset)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img boot=casper nomodeset quiet splash ---
 
 LABEL check
+  MENU LABEL ^Check disc for defects
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=casper integrity-check quiet splash ---
+  APPEND initrd=/live/initrd.img boot=casper integrity-check quiet splash ---
+
+LABEL memtest
+  MENU LABEL Test ^memory
+  KERNEL /live/memtest
+
+LABEL hd
+  MENU LABEL Boot from first ^hard disk
+  LOCALBOOT 0x80
 EOF
 }
 
@@ -1823,22 +1547,27 @@ LABEL live
   MENU LABEL ^Live (amd64)
   MENU DEFAULT
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components quiet splash
+  APPEND initrd=/live/initrd.img boot=live components quiet splash
 
 LABEL live-forensic
   MENU LABEL Live (^forensic mode)
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components noswap noautomount
+  APPEND initrd=/live/initrd.img boot=live components noswap noautomount
 
 LABEL live-persistence
   MENU LABEL ^Live USB Persistence
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components persistence persistence-encryption=luks quiet splash
+  APPEND initrd=/live/initrd.img boot=live components persistence quiet splash
 
 LABEL live-encrypted-persistence
   MENU LABEL ^Live USB Encrypted Persistence
   KERNEL /live/vmlinuz
-  APPEND initrd=/live/initrd boot=live components persistent=cryptsetup persistence-encryption=luks quiet splash
+  APPEND initrd=/live/initrd.img boot=live components persistent=cryptsetup persistence-encryption=luks quiet splash
+
+LABEL live-nomodeset
+  MENU LABEL Live (nomodeset)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img boot=live components nomodeset quiet splash
 EOF
 }
 
@@ -1854,6 +1583,7 @@ setup_grub_uefi() {
         "/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed"
         "/boot/efi/EFI/kali/grubx64.efi"
         "/usr/lib/grub/x86_64-efi-signed/grubx64.efi"
+        "/boot/efi/EFI/debian/grubx64.efi"
     )
     
     local found=false
@@ -1880,35 +1610,52 @@ setup_grub_uefi() {
 }
 
 setup_grub_default() {
-    $SUDO tee "$CDROOT_DIR/EFI/boot/grub.cfg" > /dev/null << 'EOF'
+    $SUDO mkdir -p "$CDROOT_DIR/boot/grub"
+    $SUDO tee "$CDROOT_DIR/boot/grub/grub.cfg" > /dev/null << 'EOF'
 set timeout=30
 set default=0
 
 menuentry "Live System" {
     linux /live/vmlinuz boot=casper quiet splash ---
-    initrd /live/initrd
+    initrd /live/initrd.img
+}
+
+menuentry "Live System (nomodeset)" {
+    linux /live/vmlinuz boot=casper nomodeset quiet splash ---
+    initrd /live/initrd.img
+}
+
+menuentry "Check disc for defects" {
+    linux /live/vmlinuz boot=casper integrity-check quiet splash ---
+    initrd /live/initrd.img
 }
 EOF
 }
 
 setup_grub_kali() {
-    $SUDO tee "$CDROOT_DIR/EFI/boot/grub.cfg" > /dev/null << 'EOF'
+    $SUDO mkdir -p "$CDROOT_DIR/boot/grub"
+    $SUDO tee "$CDROOT_DIR/boot/grub/grub.cfg" > /dev/null << 'EOF'
 set timeout=30
 set default=0
 
 menuentry "Kali Live" {
     linux /live/vmlinuz boot=live components quiet splash
-    initrd /live/initrd
+    initrd /live/initrd.img
 }
 
 menuentry "Kali Live (forensic mode)" {
     linux /live/vmlinuz boot=live components noswap noautomount
-    initrd /live/initrd
+    initrd /live/initrd.img
 }
 
 menuentry "Kali Live (persistence)" {
-    linux /live/vmlinuz boot=live components persistence persistence-encryption=luks quiet splash
-    initrd /live/initrd
+    linux /live/vmlinuz boot=live components persistence quiet splash
+    initrd /live/initrd.img
+}
+
+menuentry "Kali Live (encrypted persistence)" {
+    linux /live/vmlinuz boot=live components persistent=cryptsetup persistence-encryption=luks quiet splash
+    initrd /live/initrd.img
 }
 EOF
 }
@@ -1925,9 +1672,11 @@ create_iso_metadata() {
     
     echo "$fs_size" | $SUDO tee "$CDROOT_DIR/live/filesystem.size" >/dev/null
     
-    # Create manifest
-    $SUDO chroot "$EXTRACT_DIR" dpkg-query -W --showformat='${Package} ${Version}\n' | \
-        $SUDO tee "$CDROOT_DIR/live/filesystem.manifest" >/dev/null || true
+    # Create manifest if dpkg is available in chroot
+    if [[ -f "$EXTRACT_DIR/usr/bin/dpkg-query" ]]; then
+        $SUDO chroot "$EXTRACT_DIR" dpkg-query -W --showformat='${Package} ${Version}\n' | \
+            $SUDO tee "$CDROOT_DIR/live/filesystem.manifest" >/dev/null || true
+    fi
     
     # Create .disk info
     $SUDO mkdir -p "$CDROOT_DIR/.disk"
@@ -1940,6 +1689,10 @@ create_iso_metadata() {
     fi
     
     echo "$distro_name Live CD - Built $(date '+%Y-%m-%d')" | $SUDO tee "$CDROOT_DIR/.disk/info" >/dev/null
+    
+    # Create empty files that some systems expect
+    $SUDO touch "$CDROOT_DIR/.disk/base_installable"
+    echo "full_cd/single" | $SUDO tee "$CDROOT_DIR/.disk/cd_type" >/dev/null
     
     return 0
 }
@@ -2007,6 +1760,7 @@ create_iso_enhanced() {
             -no-emul-boot
             -boot-load-size 4
             -boot-info-table
+            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin
         )
         log_info "✓ BIOS boot support enabled"
     else
@@ -2019,6 +1773,7 @@ create_iso_enhanced() {
             -eltorito-alt-boot
             -e EFI/boot/bootx64.efi
             -no-emul-boot
+            -isohybrid-gpt-basdat
         )
         log_info "✓ UEFI boot support enabled"
     else
@@ -2074,17 +1829,11 @@ create_iso_enhanced() {
     
     if [[ $iso_status -ne 0 ]]; then
         log_error "ISO creation failed"
-        return 1
-    fi
-    
-    # Make hybrid
-    if command -v isohybrid >/dev/null 2>&1; then
-        log_progress "Making ISO USB-bootable..."
-        if $SUDO isohybrid "$iso_file" 2>/dev/null; then
-            log_progress_done "✓ ISO is now USB-bootable"
-        else
-            log_warning "⚠ Could not make ISO hybrid (not critical)"
+        if grep -q "isohdpfx.bin" "$xorriso_output"; then
+            log_warning "Missing isohdpfx.bin - install isolinux package"
+            log_info "sudo apt-get install isolinux"
         fi
+        return 1
     fi
     
     # Calculate checksums with progress
@@ -2161,19 +1910,7 @@ atomic_operation() {
     log_info "Starting: $operation_name"
     save_state "atomic_${operation_name}_start"
     
-    # Show transition message
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}Stage: ${BOLD}$operation_name${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    
     local start_time=$(date +%s)
-    
-    # Add disk activity monitoring for operations that do heavy I/O
-    if [[ "$operation_name" =~ (system_copy|post_cleanup|squashfs) ]]; then
-        show_disk_activity
-    fi
     
     if $operation_function; then
         local duration=$(($(date +%s) - start_time))
@@ -2204,7 +1941,7 @@ EOF
     echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Mount-safe: Protects against copying mounted drives${NC}"
+    echo -e "${GREEN}Fixed chroot configuration and network setup${NC}"
     echo ""
 }
 
@@ -2378,7 +2115,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Mount-safe version that prevents copying mounted drives!"
+            echo "Fixed chroot configuration with proper network setup!"
             exit 0
             ;;
         -q|--quiet)
