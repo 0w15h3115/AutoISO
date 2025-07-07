@@ -1163,8 +1163,14 @@ PACKAGES=(
     systemd-sysv
     network-manager
     wpasupplicant
-    firmware-linux
 )
+
+# Add firmware packages if available
+for fw_pkg in firmware-linux firmware-linux-nonfree firmware-misc-nonfree; do
+    if apt-cache show "$fw_pkg" >/dev/null 2>&1; then
+        PACKAGES+=("$fw_pkg")
+    fi
+done
 
 # Add kernel if not present
 if ! dpkg -l | grep -q "^ii.*linux-image"; then
