@@ -1,6 +1,6 @@
 #!/bin/bash
-# Enhanced AutoISO v3.1.3 - Professional Live ISO Creator with Kali Linux Support
-# Fixed chroot configuration and network setup
+# Enhanced AutoISO v3.1.4 - Professional Live ISO Creator with Kali Linux Support
+# Fixed chroot configuration, network setup, and uses gzip compression for speed
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 # ========================================
 
 # Global configuration
-readonly SCRIPT_VERSION="3.1.3"
+readonly SCRIPT_VERSION="3.1.4"
 readonly MIN_SPACE_GB=20
 readonly RECOMMENDED_SPACE_GB=30
 readonly MAX_PATH_LENGTH=180
@@ -398,7 +398,7 @@ validate_space_detailed() {
     # Calculate space requirements with detailed breakdown
     local space_breakdown=(
         "System copy:$((system_size_gb + 2))"
-        "SquashFS:$((system_size_gb / 2 + 1))"
+        "SquashFS:$((system_size_gb * 2 / 3 + 1))"  # gzip compresses to ~65-70% of original
         "ISO overhead:2"
         "Working space:3"
         "Safety margin:5"
@@ -722,6 +722,19 @@ enhanced_rsync() {
     
     total_size_human=$(numfmt --to=iec-i --suffix=B "$total_size_bytes" 2>/dev/null || echo "~10GB")
     
+    # Warn if system seems unusually large
+    local size_gb=$((total_size_bytes / 1024 / 1024 / 1024))
+    if [[ $size_gb -gt 100 ]]; then
+        log_warning "System appears to be ${size_gb}GB - this seems unusually large!"
+        log_warning "This might indicate external drives are being included."
+        echo ""
+        read -p "Continue anyway? (y/N): " -r continue_large
+        if [[ ! "$continue_large" =~ ^[Yy]$ ]]; then
+            log_error "Aborted by user due to large system size"
+            exit 1
+        fi
+    fi
+    
     log_info "Estimated data to copy: $total_size_human"
     echo ""
     
@@ -731,6 +744,15 @@ enhanced_rsync() {
         "/lost+found" "/.cache" "/var/cache/*" "/var/log/*.log"
         "/var/lib/docker/*" "/snap/*" "/swapfile" "$WORKDIR"
     )
+    
+    # Add all mount points to exclusions (except /)
+    log_info "Detecting and excluding all mount points..."
+    while IFS= read -r mount_point; do
+        if [[ "$mount_point" != "/" && "$mount_point" != "$WORKDIR"* ]]; then
+            exclude_patterns+=("$mount_point/*")
+            log_debug "Excluding mount point: $mount_point"
+        fi
+    done < <(findmnt -rno TARGET -t notmpfs,nodevtmpfs,nosysfs,noproc,nodevpts)
     
     # Add Kali-specific exclusions if needed
     if [[ "${SCRIPT_STATE[distribution]}" == "kali" ]]; then
@@ -742,11 +764,11 @@ enhanced_rsync() {
     fi
     
     local rsync_opts=(
-        -aAXHx
+        -aAXH
+        --one-file-system
         --partial
         --partial-dir="$rsync_partial_dir"
         --numeric-ids
-        --one-file-system
         --log-file="$rsync_log"
         --stats
         --human-readable
@@ -757,6 +779,16 @@ enhanced_rsync() {
     done
     
     log_info "Starting system copy... This may take 10-30 minutes depending on system size."
+    
+    # Show excluded mount points for transparency
+    log_info "The following mount points will be excluded:"
+    for pattern in "${exclude_patterns[@]}"; do
+        if [[ "$pattern" =~ ^/[^*]+/\*$ ]] && [[ "$pattern" != "/dev/*" ]] && [[ "$pattern" != "/proc/*" ]] && [[ "$pattern" != "/sys/*" ]]; then
+            echo "  - ${pattern%/*}"
+        fi
+    done
+    echo ""
+    
     SCRIPT_STATE[cleanup_required]="true"
     save_state "rsync_active"
     
@@ -1261,15 +1293,16 @@ create_squashfs_enhanced() {
         source_size_human="N/A"
     fi
     
-    # Estimate compressed size (typically 40-50% of original)
+    # Estimate compressed size (typically 30-40% of original for gzip)
     local estimated_compressed=0
     if [[ "$source_size_bytes" =~ ^[0-9]+$ ]] && [[ "$source_size_bytes" -gt 0 ]]; then
-        estimated_compressed=$((source_size_bytes / 1024 / 1024 / 2))
+        estimated_compressed=$((source_size_bytes * 100 / 1024 / 1024 / 3))  # ~33% compression
     fi
     
     log_info "Source size: $source_size_human"
     log_info "Estimated compressed size: ~${estimated_compressed}MB"
     log_info "Using $processors CPU cores and ${mem_limit}MB memory"
+    log_info "Compression: gzip (faster compression)"
     echo ""
     
     local squashfs_opts=(
@@ -1281,7 +1314,7 @@ create_squashfs_enhanced() {
         -mem "${mem_limit}M"
     )
     
-    log_info "Creating compressed filesystem... This typically takes 5-15 minutes."
+    log_info "Creating compressed filesystem... This typically takes 2-5 minutes with gzip."
     echo ""
     
     # Run mksquashfs with progress parsing
@@ -1943,10 +1976,9 @@ show_welcome() {
 /_/  |_\__,_/\__/\____/___//____/\____/   
                                           
 EOF
-    echo -e "${NC}"
     echo -e "${BOLD}Enhanced AutoISO v$SCRIPT_VERSION${NC} - Professional Live ISO Creator"
     echo -e "${CYAN}Creating bootable Ubuntu/Debian/Kali live ISOs with style${NC}"
-    echo -e "${GREEN}Fixed chroot configuration and network setup${NC}"
+    echo -e "${GREEN}Uses fast gzip compression for quicker builds${NC}"
     echo ""
 }
 
@@ -2120,7 +2152,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--version)
             echo "Enhanced AutoISO v$SCRIPT_VERSION"
-            echo "Fixed chroot configuration with proper network setup!"
+            echo "Now uses fast gzip compression for quicker builds!"
             exit 0
             ;;
         -q|--quiet)
