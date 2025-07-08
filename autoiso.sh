@@ -1275,8 +1275,7 @@ create_squashfs_enhanced() {
     local squashfs_opts=(
         -no-exports
         -noappend
-        -comp xz
-        -Xbcj x86
+        -comp gzip
         -b 1M
         -processors "$processors"
         -mem "${mem_limit}M"
