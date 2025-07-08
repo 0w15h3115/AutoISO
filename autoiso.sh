@@ -2080,22 +2080,22 @@ main() {
         "init"|"workspace_prepared")
             atomic_operation "system_copy" enhanced_rsync || exit 1
             ;&
-        "atomic_system_copy_complete")
+        "atomic_system_copy_start"|"atomic_system_copy_complete")
             atomic_operation "post_cleanup" post_copy_cleanup || exit 1
             ;&
-        "atomic_post_cleanup_complete")
+        "atomic_post_cleanup_start"|"atomic_post_cleanup_complete")
             atomic_operation "chroot_config" configure_chroot_enhanced || exit 1
             ;&
-        "atomic_chroot_config_complete")
+        "atomic_chroot_config_start"|"atomic_chroot_config_complete")
             atomic_operation "squashfs" create_squashfs_enhanced || exit 1
             ;&
-        "atomic_squashfs_complete")
+        "atomic_squashfs_start"|"atomic_squashfs_complete")
             atomic_operation "bootloader" setup_bootloader_enhanced || exit 1
             ;&
-        "atomic_bootloader_complete")
+        "atomic_bootloader_start"|"atomic_bootloader_complete")
             atomic_operation "iso_creation" create_iso_enhanced || exit 1
             ;&
-        "atomic_iso_creation_complete")
+        "atomic_iso_creation_start"|"atomic_iso_creation_complete")
             show_summary
             ;;
         *)
